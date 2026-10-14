@@ -1,0 +1,16 @@
+openbq-kdb
+Copyright 2026 SecretoftheUniverse.com LLC
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Provenance: `openbq_kdb/`, `scripts/` and `tests/` are bdobb-dev/openbb-docker's
+`kdb-store/`, and `q/` is its `kdb-ws/`, as ported into Adventures-OpenBQ/openbq-docker
+`claude/openbq-docker-v10` from openbb-docker v10.1.7 (d606169), with that port's own
+changes (crash recovery, the tick spool's store support, the lake seam). The port's
+ledger, with the donor commits, is openbq-docker `docs/v10/live-grid-kdb-port.md`.
+Original author of the donor work: Art Cashin (artcashin), with Claude co-author
+trailers. Renamed openbq-kdb (module openbq_kdb) for Adventures-OpenBQ.
+
+kdb+ / KDB-X and PyKX are KX Systems products under their own licences. They are not
+included here: the stack runs a kdb-x image built from KX's portal with the operator's
+own licence, and PyKX is installed from PyPI.

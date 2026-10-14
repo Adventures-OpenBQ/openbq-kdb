@@ -1,0 +1,367 @@
+<!-- Copyright 2026 SecretoftheUniverse.com LLC. Licensed under the Apache License, Version 2.0. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>kdb tick cache — live chart test</title>
+<script src="https://unpkg.com/lightweight-charts@5.0.8/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  body { font-family: -apple-system, sans-serif; margin: 12px; background: #111; color: #ddd; }
+  #status { font-size: 13px; margin-bottom: 8px; }
+  #status b { color: #6c6; }
+  #chart { width: 100%; height: 75vh; }
+  #tools { display: inline-flex; gap: 4px; margin-right: 10px; vertical-align: middle; }
+  #tools button { background: #1c1c1c; color: #aaa; border: 1px solid #333; border-radius: 4px;
+                  padding: 2px 8px; font-size: 13px; cursor: pointer; }
+  #tools button.active { background: #2c313a; color: #fff; border-color: #61afef; }
+  #fleet { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 8px; font-size: 12px;
+           font-variant-numeric: tabular-nums; color: #9aa0a6; }
+  #fleet span b { color: #ddd; font-weight: 600; cursor: pointer; }
+  #fleet span.up b { color: #26a69a; } #fleet span.down b { color: #ef5350; }
+</style>
+</head>
+<body>
+<div>
+  <span id="tools">
+    <button id="tool-anchor" class="active" title="click the chart to anchor an AVWAP">⚓ anchor</button>
+    <button id="tool-segment" title="two clicks draw a closed segment">╱ segment</button>
+    <button id="tool-ray" title="two clicks draw an open ray, extended as bars arrive">↗ ray</button>
+    <button id="tool-fib" title="two clicks (swing start, swing end) draw retracement levels">ƒ fib</button>
+    <button id="tool-gann" title="one click on a swing point fans 30/45/60 degree lines, up from a low, down from a high">∠ gann</button>
+    <button id="tool-level" title="one click drops a horizontal support/resistance line at that price">─ level</button>
+    <button id="tool-clear" title="forget saved anchors and drawings, reload">🗑 clear</button>
+  </span>
+  <span id="status">connecting…</span>
+</div>
+<div id="chart"></div>
+<div id="fleet"></div>
+<script>
+// ?sym=BTC-USD&interval=30&anchor=2026-08-28T14:30:00 to override;
+// 10s bars so movement is visible fast; anchor defaults to UTC midnight
+const qs = new URLSearchParams(location.search);
+const SYM = qs.get('sym') || 'AAPL', INTERVAL_S = Number(qs.get('interval')) || 10;
+const ANCHOR = qs.get('anchor') || new Date().toISOString().slice(0, 10) + 'T00:00:00';
+const status = document.getElementById('status');
+
+const chart = LightweightCharts.createChart(document.getElementById('chart'), {
+  autoSize: true,
+  layout: { background: { color: '#111' }, textColor: '#ddd' },
+  grid: { vertLines: { color: '#222' }, horzLines: { color: '#222' } },
+  timeScale: { timeVisible: true, secondsVisible: true },
+});
+const candles = chart.addSeries(LightweightCharts.CandlestickSeries, {
+  upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
+  wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+});
+
+// lightweight-charts time = unix seconds, ascending and unique per series
+const toSec = (iso) => Math.floor(Date.parse(iso.slice(0, 23) + 'Z') / 1000);
+const bucketSec = (iso) => Math.floor(toSec(iso) / INTERVAL_S) * INTERVAL_S;
+
+let bar = null;           // the in-progress bar
+let ticks = 0, lastPrice = null;
+
+// Anchored VWAP overlays -- one per anchor, each a series SERVED BY KDB:
+// the avwap request returns the trade-true series (sum(price*size)/sum(size)
+// from the actual ticks) plus running pv/vol totals, and the client extends
+// it per live tick. Click the chart to anchor a new one at that time.
+// `ready` gates live accumulation: ticks that arrive before the response
+// are already inside the server's sums.
+const PALETTE = ['#f0ad4e', '#61afef', '#c678dd', '#98c379', '#e06c75', '#56b6c2'];
+const anchors = new Map(); // anchor iso -> {line, pv, vol, lastSec, ready}
+
+function addAnchor(iso, fit) {
+  if (anchors.has(iso) || anchors.size >= PALETTE.length || ws.readyState !== 1) return;
+  const line = chart.addSeries(LightweightCharts.LineSeries, {
+    color: PALETTE[anchors.size % PALETTE.length], lineWidth: 2,
+    priceLineVisible: false, title: 'AVWAP ' + iso.slice(11, 16) + 'Z',
+  });
+  anchors.set(iso, { line, pv: 0, vol: 0, lastSec: 0, ready: false, fit });
+  ws.send(JSON.stringify({ type: 'avwap', sym: SYM, anchor: iso, interval: INTERVAL_S }));
+  persist();
+}
+
+// Trendlines: pure client-side geometry, recorded in CHART coordinates
+// (bar time + price, never pixels) so a refresh redraws them -- the same
+// way an avwap is defined by its anchor time. 'segment' is closed (ends at
+// its two points); 'ray' is open (extended through the second point as new
+// bars arrive). Everything persists per symbol in localStorage.
+let tool = 'anchor';
+let pendingPoint = null; // first drawing click, awaiting the second
+const drawings = [];     // {kind:'segment'|'ray', a:{time,value}, b:{time,value}, line}
+
+const STORE_KEY = 'kdbws:' + SYM;
+function loadSaved() {
+  try { return JSON.parse(localStorage.getItem(STORE_KEY)) || {}; } catch { return {}; }
+}
+// horizontal support/resistance: recorded as ONE price, rendered by the
+// platform's own price-line primitive -- a level is a price, not geometry
+const levels = [];
+function addLevel(price) {
+  candles.createPriceLine({
+    price, color: '#9aa0a6', lineWidth: 1, axisLabelVisible: true,
+    lineStyle: LightweightCharts.LineStyle.Dashed, title: 'S/R',
+  });
+  levels.push(price);
+  persist();
+}
+
+function persist() {
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify({
+      anchors: [...anchors.keys()],
+      levels,
+      drawings: drawings.map(d => (
+        { kind: d.kind, a: d.a, b: d.b, slope: d.slope, slopes: d.slopes })),
+    }));
+  } catch { /* storage unavailable: drawings just live for the session */ }
+}
+
+const toolButtons = {
+  anchor: document.getElementById('tool-anchor'),
+  segment: document.getElementById('tool-segment'),
+  ray: document.getElementById('tool-ray'),
+  fib: document.getElementById('tool-fib'),
+  gann: document.getElementById('tool-gann'),
+  level: document.getElementById('tool-level'),
+};
+for (const [name, btn] of Object.entries(toolButtons)) {
+  btn.onclick = () => {
+    tool = name; pendingPoint = null;
+    for (const b of Object.values(toolButtons)) b.classList.remove('active');
+    btn.classList.add('active');
+    showStatus();
+  };
+}
+document.getElementById('tool-clear').onclick = () => {
+  try { localStorage.removeItem(STORE_KEY); } catch { /* ignore */ }
+  location.reload();
+};
+
+// Fibonacci retracement: a is the swing START (100%), b the swing END (0%);
+// levels sit between the two recorded prices and extend to the latest bar.
+const FIB_LEVELS = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1];
+
+function renderDrawing(d) {
+  if (d.kind === 'gann') {
+    // fanned from one recorded point along three recorded slopes
+    const t = Math.max(d.a.time + INTERVAL_S, bar ? bar.time : d.a.time + INTERVAL_S);
+    d.lines.forEach((line, i) => line.setData(
+      [d.a, { time: t, value: d.a.value + d.slopes[i] * (t - d.a.time) }]));
+    return;
+  }
+  const tFar = Math.max(d.b.time, bar ? bar.time : d.b.time);
+  if (d.kind === 'fib') {
+    const t0 = Math.min(d.a.time, d.b.time);
+    d.lines.forEach((line, i) => {
+      const price = d.b.value + (d.a.value - d.b.value) * FIB_LEVELS[i];
+      line.setData([{ time: t0, value: price }, { time: tFar, value: price }]);
+    });
+    return;
+  }
+  // an open ray is DEFINED by its anchor point and recorded slope (price
+  // per second) -- the far end is always a.value + slope * dt, ridden out
+  // to the latest bar; the second click only ever fixed the slope
+  let far = d.b;
+  if (d.kind === 'ray') {
+    far = { time: tFar, value: d.a.value + d.slope * (tFar - d.a.time) };
+  }
+  d.line.setData([d.a, far]);
+}
+
+const _drawSeries = (opts) => chart.addSeries(LightweightCharts.LineSeries, {
+  color: '#abb2bf', lineWidth: 1, priceLineVisible: false,
+  lastValueVisible: false, crosshairMarkerVisible: false,
+  // drawings annotate the price scale, they must not drive it: a gann
+  // fan's 60-degree far end would otherwise squash the candles
+  autoscaleInfoProvider: () => null, ...opts,
+});
+
+const GANN_DEGREES = [30, 45, 60];
+
+function addGann(a) {
+  // relative high or low? the click nearer the surrounding bars' low fans
+  // up; nearer their high fans down
+  const win = candles.data().filter((c) => Math.abs(c.time - a.time) <= 5 * INTERVAL_S);
+  const hi = win.length ? Math.max(...win.map((c) => c.high)) : a.value;
+  const lo = win.length ? Math.min(...win.map((c) => c.low)) : a.value;
+  const sign = (a.value - lo) <= (hi - a.value) ? 1 : -1;
+  // a chart "degree" is scale-dependent, so the angles are measured on
+  // screen AT DRAW TIME, then recorded as data slopes (price per second) --
+  // a redraw reproduces the same fan even after the view rescales
+  const el = document.getElementById('chart');
+  const vr = chart.timeScale().getVisibleRange();
+  const pTop = candles.coordinateToPrice(0);
+  const pBot = candles.coordinateToPrice(el.clientHeight);
+  if (!vr || pTop == null || pBot == null) return;
+  const k = ((pTop - pBot) / el.clientHeight) / ((vr.to - vr.from) / el.clientWidth);
+  const slopes = GANN_DEGREES.map((deg) => sign * Math.tan(deg * Math.PI / 180) * k);
+  materializeDrawing({ kind: 'gann', a, slopes });
+  persist();
+}
+
+function materializeDrawing(d) {
+  if (d.kind === 'gann') {
+    d.lines = GANN_DEGREES.map((deg) => _drawSeries({ color: '#4aa3c8', title: deg + '°' }));
+    drawings.push(d);
+    renderDrawing(d);
+    return;
+  }
+  // back-compat: drawings saved before slopes were recorded derive one
+  if (d.slope == null) d.slope = (d.b.value - d.a.value) / (d.b.time - d.a.time);
+  if (d.kind === 'fib') {
+    d.lines = FIB_LEVELS.map((lvl) => _drawSeries({
+      color: '#c8a24a', title: (lvl * 100).toFixed(1).replace('.0', '') + '%',
+    }));
+  } else {
+    d.line = _drawSeries({});
+  }
+  drawings.push(d);
+  renderDrawing(d);
+}
+
+function addDrawing(kind, a, b) {
+  if (a.time === b.time) return; // zero-width: ignore
+  if (b.time < a.time) [a, b] = [b, a];
+  materializeDrawing({ kind, a, b, slope: (b.value - a.value) / (b.time - a.time) });
+  persist();
+}
+
+chart.subscribeClick((p) => {
+  if (!p.time) return;
+  if (tool === 'anchor') {
+    addAnchor(new Date(p.time * 1000).toISOString().slice(0, 19), false);
+    return;
+  }
+  if (!p.point) return;
+  const point = { time: p.time, value: candles.coordinateToPrice(p.point.y) };
+  if (point.value == null) return;
+  if (tool === 'gann') { addGann(point); showStatus(); return; }
+  if (tool === 'level') { addLevel(point.value); showStatus(); return; }
+  if (!pendingPoint) { pendingPoint = point; } else { addDrawing(tool, pendingPoint, point); pendingPoint = null; }
+  showStatus();
+});
+
+function applyTick(r) {
+  const t = bucketSec(r.time), p = r.price, v = r.size || 0;
+  if (bar && bar.time === t) {
+    bar.high = Math.max(bar.high, p); bar.low = Math.min(bar.low, p);
+    bar.close = p;
+  } else if (!bar || t > bar.time) {
+    bar = { time: t, open: p, high: p, low: p, close: p };
+  } else {
+    return; // out-of-order tick from a bucket already closed -- demo skips it
+  }
+  candles.update(bar);
+  ticks++; lastPrice = p;
+}
+
+function showStatus() {
+  const parts = [...anchors.entries()]
+    .filter(([, a]) => a.vol > 0)
+    .map(([iso, a]) => `avwap(${iso.slice(11, 16)}Z) ${(a.pv / a.vol).toFixed(2)}`);
+  const avNow = parts.length ? ' · ' + parts.join(' · ') : '';
+  const hint = tool === 'anchor'
+    ? 'click chart to anchor'
+    : tool === 'gann'
+      ? 'gann: click a relative high or low'
+      : tool === 'level'
+        ? 'level: click a price'
+        : `${tool}: click the ${pendingPoint ? 'second' : 'first'} point`;
+  status.innerHTML = `<b>live</b> — ${ticks} ticks · last ${lastPrice?.toFixed(2)}${avNow} · ${hint}`;
+}
+
+// ?ws= overrides; default assumes kdb's websocket lives on THIS page's
+// host at :5999 -- true both for the local demo server and when served
+// from live-grid's /static behind tailscale Serve on the same node
+const WS_URL = qs.get('ws')
+  || (location.protocol === 'https:' ? 'wss://' : 'ws://') + (location.hostname || '127.0.0.1') + ':5999/';
+const ws = new WebSocket(WS_URL);
+ws.onopen = () => {
+  status.textContent = 'connected — requesting bars + avwap, subscribing';
+  ws.send(JSON.stringify({ type: 'bars', sym: SYM, interval: INTERVAL_S }));
+  ws.send(JSON.stringify({ type: 'sub', syms: [SYM] }));
+  // restore what previous sessions recorded -- in chart coordinates, so a
+  // refresh replaces every anchor and drawing exactly where it was. Read
+  // BEFORE the first addAnchor: adding persists, which would overwrite the
+  // saved state with just the default anchor.
+  const saved = loadSaved();
+  addAnchor(ANCHOR, true);
+  for (const iso of saved.anchors || []) addAnchor(iso, false);
+  // restore verbatim -- the recorded slope, not one re-derived from pixels
+  for (const d of saved.drawings || []) materializeDrawing({ ...d });
+  for (const price of saved.levels || []) addLevel(price);
+  // re-persist the COMPLETE state: the default anchor's persist above wrote
+  // while drawings was still empty, so without this a drawing survives
+  // exactly one refresh (restored on screen, absent from storage)
+  persist();
+};
+ws.onmessage = (ev) => {
+  const m = JSON.parse(ev.data);
+  if (m.table === 'bars') {
+    const data = m.data.map(b => ({ time: bucketSec(b.barTime), open: b.open, high: b.high, low: b.low, close: b.close }));
+    candles.setData(data);
+    bar = data[data.length - 1] || null;
+    chart.timeScale().fitContent();
+  } else if (m.table === 'avwap') {
+    const a = anchors.get(m.anchor);
+    if (!a) return;
+    // collapse to one point per BAR bucket (last value wins): setData needs
+    // unique ascending times, and sub-bar points would shrink the time
+    // scale's unit to seconds, drawing the candles skinny
+    const bySec = new Map(m.data.map(p => [bucketSec(p.time), p.avwap]));
+    a.line.setData([...bySec].map(([time, value]) => ({ time, value })));
+    a.pv = m.pv; a.vol = m.vol; a.ready = true;
+    a.lastSec = Math.max(0, ...bySec.keys());
+    // per-second line points re-derive the time scale's bar unit, which
+    // collapses the view to seconds -- re-fit after the initial seed lands
+    // (not for click-added anchors: yanking the view under a click is rude)
+    if (a.fit) chart.timeScale().fitContent();
+    showStatus();
+  } else if (m.table === 'trades') {
+    m.data.forEach(applyTick);
+    if (m.data.length) {
+      const sec = bucketSec(m.data[m.data.length - 1].time);
+      for (const a of anchors.values()) {
+        if (!a.ready) continue;
+        for (const r of m.data) { a.pv += r.price * (r.size || 0); a.vol += r.size || 0; }
+        if (a.vol > 0 && sec >= a.lastSec) {
+          a.line.update({ time: sec, value: a.pv / a.vol }); // same-bucket update replaces
+          a.lastSec = sec;
+        }
+      }
+      for (const d of drawings) if (d.kind !== 'segment') renderDrawing(d); // open kinds ride the live edge
+    }
+    showStatus();
+  }
+};
+// the fleet strip: last price + tick count per cached symbol, from the
+// stats message every 5s; click a symbol to open its chart
+const fleetEl = document.getElementById('fleet');
+const fleetPrev = {};
+function renderFleet(stats) {
+  fleetEl.innerHTML = stats.syms
+    .sort((x, y) => y.n - x.n)
+    .map((s) => {
+      const dir = fleetPrev[s.sym] == null || s.price === fleetPrev[s.sym] ? '' : (s.price > fleetPrev[s.sym] ? 'up' : 'down');
+      fleetPrev[s.sym] = s.price;
+      return `<span class="${dir}"><b data-sym="${s.sym}">${s.sym}</b> ${s.price} · ${s.n.toLocaleString()}</span>`;
+    }).join('');
+}
+fleetEl.onclick = (e) => {
+  const sym = e.target.dataset && e.target.dataset.sym;
+  if (sym) location.search = `?sym=${sym}&interval=${INTERVAL_S}`;
+};
+setInterval(() => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'stats' })); }, 5000);
+ws.addEventListener('message', (ev) => {
+  const m = JSON.parse(ev.data);
+  if (m.table === 'stats') renderFleet(m);
+});
+
+ws.onclose = () => { status.textContent = 'disconnected'; };
+ws.onerror = () => { status.textContent = 'websocket error — is the openbb-kdb container up?'; };
+</script>
+</body>
+</html>

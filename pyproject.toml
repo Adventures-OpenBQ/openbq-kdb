@@ -1,0 +1,32 @@
+# Copyright 2026 SecretoftheUniverse.com LLC. Licensed under the Apache License, Version 2.0.
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openbq-kdb"
+version = "10.0.0"
+description = "Shared kdb+ session and store: the single-owner-thread PyKX plumbing"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = ["pykx>=3.2", "pandas"]
+
+[tool.setuptools.packages.find]
+include = ["openbq_kdb*"]
+
+[project.optional-dependencies]
+dev = ["ruff==0.15.22", "pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+ignore = ["PLC0415"]
