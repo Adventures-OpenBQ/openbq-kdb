@@ -55,7 +55,11 @@ def test_persist_logs_every_upd_under_data_logs_once():
 
 def test_persist_replays_on_boot_only_and_before_opening_the_log():
     replay = PERSIST.index("if[not count trades;")
-    assert "-11! ` sv .tlog.dir,f} each asc key .tlog.dir" in PERSIST
+    # D25: today and the two days before; D4: each file trapped, a torn tail cut back.
+    assert ".tlog.replayDays:2;" in PERSIST
+    assert '{x where x>=`$"tlog_",string .z.d-.tlog.replayDays} asc key .tlog.dir];' in PERSIST
+    assert "@[.tlog.replay;f;" in PERSIST and "n:-11!(-2;p);" in PERSIST
+    assert "p 1: read1(p;0;n 1); n:n 0];" in PERSIST and "-11!(n;p)}" in PERSIST
     # the handle is still null during the replay, so replayed upds are not re-logged
     assert PERSIST.index(".tlog.h:0N;") < replay < PERSIST.index(".tlog.open .z.d;")
 
@@ -114,6 +118,23 @@ def test_replay_covers_every_unpruned_day_oldest_first(tmp_path):
     assert len(q2.trades) == 7
 
 
+def test_the_model_replays_only_the_window_and_cuts_a_torn_tail(tmp_path):
+    host = Host(tmp_path, today=lambda: date(2026, 10, 9))
+    host.start().upd("trades", _ticks(4))
+    host.kill()
+    logs = Path(tmp_path) / "logs"
+    today = logs / log_name(date(2026, 10, 9))
+    for back in (2, 3):
+        (logs / log_name(date(2026, 10, 9) - timedelta(days=back))).write_text(today.read_text())
+    with open(today, "a", encoding="utf-8") as fh:
+        fh.write('{"t": "trades", "rows": [["2026-10')  # torn
+    q = host.start()
+    assert q.replayed == ["tlog_2026.10.07", "tlog_2026.10.09"] and len(q.trades) == 8
+    q.upd("trades", _ticks(1))
+    host.kill()
+    assert len(host.start().trades) == 9
+
+
 def test_the_roll_deletes_logs_older_than_seven_days(tmp_path):
     today = {"d": date(2026, 10, 1)}
     host = Host(tmp_path, today=lambda: today["d"])
@@ -134,3 +155,66 @@ def test_the_log_is_one_record_per_upd(tmp_path):
     lines = (Path(tmp_path) / "logs" / "tlog_2026.10.09").read_text().splitlines()
     assert [len(json.loads(line)["rows"]) for line in lines] == [3, 2]
     assert re.fullmatch(r"tlog_\d{4}\.\d{2}\.\d{2}", log_name(date(2026, 10, 9)))
+
+
+# -- a real q, when one is installed (QBIN, or q on PATH; skipped otherwise) ----------
+
+import os
+import shutil
+import subprocess
+
+import pytest
+
+QBIN = os.getenv("QBIN") or shutil.which("q") or str(Path.home() / ".kx/bin/q")
+_HARNESS = """trades:([] time:`timestamp$(); sym:`symbol$(); price:`float$(); size:`float$());
+upd:{[t;d] t insert d};
+system"l ",getenv`PERSIST;
+-1 .j.j `rows`logging`timer!(count trades; not null .tlog.h; system"t");
+if[count getenv`ADD; upd[`trades;([] time:enlist .z.p; sym:enlist`X; price:enlist 1f; size:enlist 1f)]];
+exit 0
+"""
+real_q = pytest.mark.skipif(not Path(QBIN).is_file(), reason="no q binary (Mac gate)")
+
+
+def _q(tmp_path, add=False):
+    """One boot of a real q running persist.q, its log directory moved under tmp_path."""
+    logs = tmp_path / "logs"
+    persist = tmp_path / "persist.q"
+    # hsym, not a `: literal: the temporary path has characters a symbol literal cannot hold.
+    persist.write_text(PERSIST.replace("`:/data/logs", f'(hsym`$"{logs}")')
+                       .replace("mkdir -p /data/logs", f"mkdir -p {logs}"))
+    (tmp_path / "harness.q").write_text(_HARNESS)
+    env = dict(os.environ, PERSIST=str(persist), ADD="1" if add else "")
+    run = subprocess.run([QBIN, str(tmp_path / "harness.q"), "-q"], env=env, cwd=tmp_path,
+                         capture_output=True, text=True, timeout=60)
+    status = [json.loads(line) for line in run.stdout.splitlines() if line.startswith("{")]
+    assert status, run.stdout + run.stderr
+    return status[-1], run.stderr
+
+
+@real_q
+def test_a_torn_log_tail_is_cut_back_and_logging_stays_on(tmp_path):
+    """D4 (2026-10-16): a host crash or ENOSPC leaves a partial chunk at the end of the log.
+    The replay keeps the whole chunks, and the rest of persist.q (the handle, the roll timer)
+    still loads, so later ticks are logged and survive the next restart."""
+    _q(tmp_path, add=True)
+    _q(tmp_path, add=True)
+    (log,) = (tmp_path / "logs").iterdir()
+    with open(log, "ab") as fh:
+        fh.write(b"\x01\x00\x00\x00\x40\x00\x00\x00torn")  # a chunk header with no body
+    status, err = _q(tmp_path, add=True)
+    assert status == {"rows": 2, "logging": True, "timer": 60000}, err
+    assert "bad tail" in err
+    assert _q(tmp_path)[0]["rows"] == 3
+
+
+@real_q
+def test_only_the_days_the_window_holds_are_replayed(tmp_path):
+    """D25: the prune is not logged, so replaying every kept log would reload days live-grid
+    drops a minute later. Only today and the two days before it are replayed."""
+    _q(tmp_path, add=True)
+    (log,) = (tmp_path / "logs").iterdir()
+    today = datetime.strptime(log.name, "tlog_%Y.%m.%d").date()
+    for back in (2, 3, 6):
+        shutil.copy(log, log.with_name(log_name(today - timedelta(days=back))))
+    assert _q(tmp_path)[0]["rows"] == 2  # today's and the day-before-yesterday's

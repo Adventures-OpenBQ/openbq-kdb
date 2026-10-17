@@ -8,9 +8,10 @@ the exact IPC statements openbq-kdb sends (the same strings, matched verbatim),
 so the real KdbSession, KdbStore and live-grid TickRecorder run unmodified
 against it:
 
-- boot: `mkdir -p /data/logs`; if `trades` is empty, replay every
-  `tlog_<YYYY.MM.DD>` oldest first (lexical order), with the log handle still
-  null so replayed updates are not logged twice; then open today's log;
+- boot: `mkdir -p /data/logs`; if `trades` is empty, replay the
+  `tlog_<YYYY.MM.DD>` of today and the 2 days before oldest first (lexical
+  order), with the log handle still null so replayed updates are not logged
+  twice, cutting a torn tail back to the last whole record; then open today's log;
 - `upd`: append the update to today's log (one record per call, written
   through immediately, as q's handle write is), then insert;
 - the daily roll: at a UTC date change open the new day's log and delete logs
@@ -32,6 +33,9 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+
+# persist.q's .tlog.replayDays: the days before today whose logs a boot replays.
+REPLAY_DAYS = 2
 
 # The statements openbq-kdb issues (openbq_kdb/store.py), matched verbatim.
 _UPD = "$[`upd in key `.; upd[`trades;incoming_ticks]; `trades insert incoming_ticks]"
@@ -84,7 +88,8 @@ class TickPlant:
         self._handle = None  # .tlog.h: null until after the replay
         os.makedirs(self.logs, exist_ok=True)  # system"mkdir -p /data/logs"
         if not len(self.trades):  # if[not count trades; ... -11! each asc key .tlog.dir]
-            for name in sorted(os.listdir(self.logs)):
+            first = log_name(self._today() - timedelta(days=REPLAY_DAYS))
+            for name in sorted(n for n in os.listdir(self.logs) if n >= first):
                 self.replayed.append(name)
                 self._replay(self.logs / name)
         self.day = self._today()
@@ -101,16 +106,20 @@ class TickPlant:
         })
 
     def _replay(self, path: Path) -> None:
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                if not line.strip():
-                    continue
-                record = json.loads(line)
-                frame = pd.DataFrame(record["rows"], columns=["time", "sym", "price", "size"])
-                # ISO8601: isoformat() omits a zero microsecond part, so one
-                # log record can mix "...:00" and "...:00.040000" stamps.
-                frame["time"] = pd.to_datetime(frame["time"], format="ISO8601")
-                self.upd(record["t"], frame)
+        # -11!(-2;f) then the cut back: keep the whole records, drop a torn last one
+        text = path.read_text(encoding="utf-8")
+        whole = text[: text.rfind("\n") + 1]
+        if whole != text:
+            path.write_text(whole, encoding="utf-8")
+        for line in whole.splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            frame = pd.DataFrame(record["rows"], columns=["time", "sym", "price", "size"])
+            # ISO8601: isoformat() omits a zero microsecond part, so one
+            # log record can mix "...:00" and "...:00.040000" stamps.
+            frame["time"] = pd.to_datetime(frame["time"], format="ISO8601")
+            self.upd(record["t"], frame)
 
     def _open(self, day: date) -> None:
         path = self.logs / log_name(day)
