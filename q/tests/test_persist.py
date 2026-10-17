@@ -66,6 +66,7 @@ def test_persist_replays_on_boot_only_and_before_opening_the_log():
     assert "@[{x 1: y}tmp;read1(p;0;n 1);{[t;e] @[hdel;t;::]; 'e}tmp];" in PERSIST  # S4
     assert " p 1: read1" not in PERSIST
     assert ".tlog.fail:{[e] @[hclose;.tlog.h;::]; .tlog.h::0N; .tlog.torn::1b;" in PERSIST  # S2
+    assert """'$["tlog: "~6#e; e; "tlog: ",e]};""" in PERSIST  # T1
     assert "n:.tlog.cut p;" in PERSIST and "-11!(n;p)}" in PERSIST
     # the handle is still null during the replay, so replayed upds are not re-logged
     assert PERSIST.index(".tlog.h:0N;") < replay < PERSIST.index(".tlog.open .z.d;")
@@ -308,3 +309,19 @@ def test_a_roll_whose_reopen_fails_leaves_no_stale_handle_and_logs_nothing_unlog
     assert status[1] == {"r0": "failed", "h": True, "t": True, "r1": "ok", "rows": 2}, err
     status, err, _ = _q(tmp_path)
     assert status["rows"] == 2, err
+
+
+@real_q
+def test_every_torn_log_refusal_starts_with_tlog_prefix(tmp_path):
+    """T1 (re-review 2026-10-17): live-grid tells a torn-log refusal (nothing applied, the disk
+    is the problem) from a poison batch by this prefix, and does not quarantine on it."""
+    _q(tmp_path, add=True)
+    row = "([] time:enlist .z.p; sym:enlist`X; price:enlist 2f; size:enlist 1f)"
+    pre = (".tlog.h:999i;"
+           f"e1:@[upd[`trades];{row};{{x}}];"  # the failed append
+           ".tlog.retryAt::.z.p+1D;"
+           f"e2:@[upd[`trades];{row};{{x}}];"  # the throttled refusal
+           "-1 .j.j `e1`e2!(e1;e2);")
+    _, err, status = _q(tmp_path, pre=pre)
+    assert status[1]["e1"].startswith("tlog: ") and "999" in status[1]["e1"], status
+    assert status[1]["e2"].startswith("tlog: torn"), status

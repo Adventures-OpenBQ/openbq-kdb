@@ -48,11 +48,14 @@ system"mkdir -p /data/logs";
 / number behind for upd, the roll or .z.exit to use after q reuses it.
 .tlog.append:{[x]
   if[.tlog.torn;
-    if[.z.p<.tlog.retryAt; '"tlog torn; cut-back retried at most every ",string .tlog.retryGap];
+    if[.z.p<.tlog.retryAt; '"tlog: torn; cut-back retried at most every ",string .tlog.retryGap];
     .tlog.retryAt::.z.p+.tlog.retryGap;
     f:.tlog.file .tlog.day; .tlog.cut f; .tlog.h::hopen f; .tlog.torn::0b];
   .tlog.h x};
-.tlog.fail:{[e] @[hclose;.tlog.h;::]; .tlog.h::0N; .tlog.torn::1b; -2 "tlog: append failed: ",e; 'e};
+/ Every signal from here starts "tlog: " (T1): live-grid reads it as "kdb refused
+/ the batch, applied nothing" -- an outage to back off from, never a poison batch.
+.tlog.fail:{[e] @[hclose;.tlog.h;::]; .tlog.h::0N; .tlog.torn::1b; -2 "tlog: append failed: ",e;
+  '$["tlog: "~6#e; e; "tlog: ",e]};
 if[not `updCore in key `.; updCore:upd];
 upd:{[t;d] if[.tlog.torn or not null .tlog.h; @[.tlog.append;enlist(`upd;t;d);.tlog.fail]]; updCore[t;d]};
 
