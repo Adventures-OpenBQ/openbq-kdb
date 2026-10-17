@@ -8,9 +8,10 @@ the exact IPC statements openbq-kdb sends (the same strings, matched verbatim),
 so the real KdbSession, KdbStore and live-grid TickRecorder run unmodified
 against it:
 
-- boot: `mkdir -p /data/logs`; if `trades` is empty, replay every
-  `tlog_<YYYY.MM.DD>` oldest first (lexical order), with the log handle still
-  null so replayed updates are not logged twice; then open today's log;
+- boot: `mkdir -p /data/logs`; if `trades` is empty, replay the
+  `tlog_<YYYY.MM.DD>` of today and the 2 days before oldest first (lexical
+  order), with the log handle still null so replayed updates are not logged
+  twice, cutting a torn tail back to the last whole record; then open today's log;
 - `upd`: append the update to today's log (one record per call, written
   through immediately, as q's handle write is), then insert;
 - the daily roll: at a UTC date change open the new day's log and delete logs
@@ -33,6 +34,9 @@ from pathlib import Path
 
 import pandas as pd
 
+# persist.q's .tlog.replayDays: the days before today whose logs a boot replays.
+REPLAY_DAYS = 2
+
 # The statements openbq-kdb issues (openbq_kdb/store.py), matched verbatim.
 _UPD = "$[`upd in key `.; upd[`trades;incoming_ticks]; `trades insert incoming_ticks]"
 _PRUNE = "{[qwcut] trades:: delete from trades where time < qwcut}"
@@ -41,7 +45,8 @@ _READ_PREFIX = "{[qwsym;qwlim] qwlim sublist `time xdesc reverse"
 _AGG_PREFIX = "{[qwsym;qwlo;qwhi;qwbucket]"
 _PROBE = ("{qwin: select time, sym, price, size from trades"
           " where time within (min probe_ticks`time; max probe_ticks`time);"
-          " sum (count qwin) > qwin ? probe_ticks}[]")
+          " qwp: count each group probe_ticks;"
+          " $[count qwin; sum (value qwp) & 0^(count each group qwin) key qwp; 0]}[]")
 
 
 class QDown(ConnectionError):
@@ -84,7 +89,8 @@ class TickPlant:
         self._handle = None  # .tlog.h: null until after the replay
         os.makedirs(self.logs, exist_ok=True)  # system"mkdir -p /data/logs"
         if not len(self.trades):  # if[not count trades; ... -11! each asc key .tlog.dir]
-            for name in sorted(os.listdir(self.logs)):
+            first = log_name(self._today() - timedelta(days=REPLAY_DAYS))
+            for name in sorted(n for n in os.listdir(self.logs) if n >= first):
                 self.replayed.append(name)
                 self._replay(self.logs / name)
         self.day = self._today()
@@ -101,16 +107,20 @@ class TickPlant:
         })
 
     def _replay(self, path: Path) -> None:
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                if not line.strip():
-                    continue
-                record = json.loads(line)
-                frame = pd.DataFrame(record["rows"], columns=["time", "sym", "price", "size"])
-                # ISO8601: isoformat() omits a zero microsecond part, so one
-                # log record can mix "...:00" and "...:00.040000" stamps.
-                frame["time"] = pd.to_datetime(frame["time"], format="ISO8601")
-                self.upd(record["t"], frame)
+        # -11!(-2;f) then the cut back: keep the whole records, drop a torn last one
+        text = path.read_text(encoding="utf-8")
+        whole = text[: text.rfind("\n") + 1]
+        if whole != text:
+            path.write_text(whole, encoding="utf-8")
+        for line in whole.splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            frame = pd.DataFrame(record["rows"], columns=["time", "sym", "price", "size"])
+            # ISO8601: isoformat() omits a zero microsecond part, so one
+            # log record can mix "...:00" and "...:00.040000" stamps.
+            frame["time"] = pd.to_datetime(frame["time"], format="ISO8601")
+            self.upd(record["t"], frame)
 
     def _open(self, day: date) -> None:
         path = self.logs / log_name(day)
@@ -196,8 +206,11 @@ class SimConn:
             probe["time"] = pd.to_datetime(probe["time"]).astype("datetime64[ns]")
             lo, hi = probe["time"].min(), probe["time"].max()
             held = p.trades[(p.trades["time"] >= lo) & (p.trades["time"] <= hi)]
-            keys = set(map(tuple, held[["time", "sym", "price", "size"]].itertuples(index=False)))
-            return _K(sum(1 for row in probe.itertuples(index=False) if tuple(row) in keys))
+            # a multiset match, as the q does: each row at most as often as the window holds it
+            from collections import Counter
+            have = Counter(map(tuple, held[["time", "sym", "price", "size"]].itertuples(index=False)))
+            want = Counter(map(tuple, probe.itertuples(index=False)))
+            return _K(sum(min(n, have[row]) for row, n in want.items()))
         if query == "delete probe_ticks from `.":
             self.globals.pop("probe_ticks", None)
             return _K(None)

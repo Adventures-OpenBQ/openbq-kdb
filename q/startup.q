@@ -123,10 +123,11 @@ if[not `trades in key `.; trades:([] time:`timestamp$(); sym:`symbol$(); price:`
   {[d;h;syms] p:select from d where sym in syms; if[count p; .wsu.send[h;p]]}[d]'[key .wsu.subs; value .wsu.subs];
  };
 
-/ HTTP (.z.ph): read-only endpoints for the NAS-side EOD flush, proxied to
-/ the tailnet by tailscale Serve -- which forwards ONLY http, so the raw q
-/ IPC surface stays unreachable off this host. Defining .z.ph also kills
-/ q's default handler, a browser console that EVALUATES code.
+/ HTTP (.z.ph): read-only endpoints the donor's NAS-side EOD flush used over
+/ tailscale Serve. openbq-docker does not carry that flush (eod-dump reads
+/ over IPC) and publishes no kdb port or Serve entry, so nothing off
+/ live-private reaches them. Defining .z.ph also kills q's default handler,
+/ a browser console that EVALUATES code.
 /   GET /syms                              -> ["AAPL",...]
 /   GET /day?date=2026-08-28&sym=AAPL      -> that UTC day's ticks, JSON
 .z.ph:{
