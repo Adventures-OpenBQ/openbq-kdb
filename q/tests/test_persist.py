@@ -63,7 +63,9 @@ def test_persist_replays_on_boot_only_and_before_opening_the_log():
             ' asc key .tlog.dir];') in PERSIST
     assert "@[.tlog.replay;f;" in PERSIST and "n:-11!(-2;p);" in PERSIST
     # Q5: the prefix goes to a temp file renamed over the log, never rewritten in place
-    assert "tmp 1: read1(p;0;n 1);" in PERSIST and " p 1: read1" not in PERSIST
+    assert "@[{x 1: y}tmp;read1(p;0;n 1);{[t;e] @[hdel;t;::]; 'e}tmp];" in PERSIST  # S4
+    assert " p 1: read1" not in PERSIST
+    assert ".tlog.fail:{[e] @[hclose;.tlog.h;::]; .tlog.h::0N; .tlog.torn::1b;" in PERSIST  # S2
     assert "n:.tlog.cut p;" in PERSIST and "-11!(n;p)}" in PERSIST
     # the handle is still null during the replay, so replayed upds are not re-logged
     assert PERSIST.index(".tlog.h:0N;") < replay < PERSIST.index(".tlog.open .z.d;")
@@ -259,3 +261,29 @@ def test_the_boot_cut_back_goes_through_a_temp_file_and_a_leftover_is_ignored(tm
     status, err, _ = _q(tmp_path)
     assert status["rows"] == 1 and "bad tail" in err
     assert sorted(p.name for p in (tmp_path / "logs").iterdir()) == [log.name]
+
+
+@real_q
+def test_a_failed_cut_back_leaves_no_tmp_and_is_retried_at_most_every_gap(tmp_path):
+    """S2/S4 (re-review 2026-10-17). A failed append nulls the handle, so the roll and .z.exit
+    can never close an fd q has since reused. While the disk stays full the cut-back's own
+    write fails: the partial tlog_<d>.tmp is deleted, and the cut-back (a read of the whole
+    log) is retried at most every .tlog.retryGap, not on every upd. Modelled by a directory
+    where the temp file would go (the write fails) and a dead handle."""
+    _q(tmp_path, add=True)
+    row = "([] time:enlist .z.p; sym:enlist`X; price:enlist {p}f; size:enlist 1f)"
+    up = "@[{{upd[`trades;x];`ok}};" + row + ";{{[e]`failed}}]"
+    pre = ("f:.tlog.file .tlog.day; f 1: read1[f],0x0100000040000000746f726e;"
+           'system "mkdir ",(1_string f),".tmp"; .tlog.h:999i;'
+           f"r1:{up.format(p=2)}; h1:null .tlog.h;"
+           f"r2:{up.format(p=3)};"
+           'tmps:sum (key .tlog.dir) like "*.tmp";'
+           f"r3:{up.format(p=4)};"
+           ".tlog.retryAt::.z.p-1;"
+           f"r4:{up.format(p=5)};"
+           "-1 .j.j `r1`h1`r2`tmps`r3`r4`rows!(r1;h1;r2;tmps;r3;r4;count trades);")
+    _, err, status = _q(tmp_path, pre=pre)
+    assert status[1] == {"r1": "failed", "h1": True, "r2": "failed", "tmps": 0,
+                         "r3": "failed", "r4": "ok", "rows": 2}, err
+    status, err, _ = _q(tmp_path)
+    assert status["rows"] == 2 and status["logging"] is True, err

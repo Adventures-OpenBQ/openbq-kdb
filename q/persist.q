@@ -14,6 +14,9 @@ system"mkdir -p /data/logs";
 .tlog.h:0N;
 .tlog.day:.z.d;
 .tlog.torn:0b;
+/ while torn, the cut-back is retried at most every .tlog.retryGap (S4)
+.tlog.retryGap:0D00:00:05;
+.tlog.retryAt:0Np;
 
 / Cut a log with a torn tail back to its whole chunks, crash-safely: -11!(-2;p)
 / answers a chunk count for a whole log, or (chunks;bytes) for the valid prefix
@@ -25,7 +28,8 @@ system"mkdir -p /data/logs";
   if[0h<type n;
     -2 "tlog: ",string[p]," has a bad tail; keeping its first ",string[n 0]," chunks (",string[n 1]," bytes)";
     tmp:`$string[p],".tmp";
-    tmp 1: read1(p;0;n 1);
+    / a failed write (ENOSPC) leaves no partial temp file behind (S4)
+    @[{x 1: y}tmp;read1(p;0;n 1);{[t;e] @[hdel;t;::]; 'e}tmp];
     system "mv ",(1_string tmp)," ",1_string p;
     n:n 0];
   n};
@@ -36,11 +40,18 @@ system"mkdir -p /data/logs";
 / closed, the log marked torn, and the error signalled -- updCore is NOT run,
 / so nothing is applied unlogged and live-grid's spool keeps the batch. The
 / next upd cuts the log back and reopens it before appending; until that
-/ succeeds, every upd signals the same way.
+/ succeeds, every upd signals the same way -- and the cut-back, which reads the
+/ whole log, is attempted at most every .tlog.retryGap (S4): in between, upd
+/ signals without touching the disk. The first attempt is immediate, so a
+/ transient failure costs nothing. The failed handle is nulled (S2), so the
+/ roll and .z.exit can never close an fd q has since reused for a connection.
 .tlog.append:{[x]
-  if[.tlog.torn; f:.tlog.file .tlog.day; .tlog.cut f; .tlog.h::hopen f; .tlog.torn::0b];
+  if[.tlog.torn;
+    if[.z.p<.tlog.retryAt; '"tlog torn; cut-back retried at most every ",string .tlog.retryGap];
+    .tlog.retryAt::.z.p+.tlog.retryGap;
+    f:.tlog.file .tlog.day; .tlog.cut f; .tlog.h::hopen f; .tlog.torn::0b];
   .tlog.h x};
-.tlog.fail:{[e] @[hclose;.tlog.h;::]; .tlog.torn::1b; -2 "tlog: append failed: ",e; 'e};
+.tlog.fail:{[e] @[hclose;.tlog.h;::]; .tlog.h::0N; .tlog.torn::1b; -2 "tlog: append failed: ",e; 'e};
 if[not `updCore in key `.; updCore:upd];
 upd:{[t;d] if[.tlog.torn or not null .tlog.h; @[.tlog.append;enlist(`upd;t;d);.tlog.fail]]; updCore[t;d]};
 
