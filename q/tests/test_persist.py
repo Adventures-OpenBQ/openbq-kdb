@@ -287,3 +287,24 @@ def test_a_failed_cut_back_leaves_no_tmp_and_is_retried_at_most_every_gap(tmp_pa
                          "r3": "failed", "r4": "ok", "rows": 2}, err
     status, err, _ = _q(tmp_path)
     assert status["rows"] == 2 and status["logging"] is True, err
+
+
+@real_q
+def test_a_roll_whose_reopen_fails_leaves_no_stale_handle_and_logs_nothing_unlogged(tmp_path):
+    """T2 (re-review 2026-10-17): at UTC midnight on a full disk the roll closed the handle,
+    then `.tlog.open` failed before `hopen`, leaving the closed fd's number in .tlog.h for q to
+    reuse -- the next upd would write into an unrelated connection. Now the handle is nulled
+    and the log marked torn first, so the next upd goes through the reopen path. Modelled by a
+    reopen that signals, as `f set ()` does on ENOSPC."""
+    _q(tmp_path, add=True)
+    up = "@[{upd[`trades;x];`ok};([] time:enlist .z.p; sym:enlist`X; price:enlist 2f; size:enlist 1f);{[e]`failed}]"
+    # The roll runs with .tlog.day on yesterday, whose log is the one that was open.
+    pre = (".tlog.day:.z.d-1; (.tlog.file .tlog.day) set (); real:.tlog.open; .tlog.open:{[d] '\"No space left on device\"};"
+           "r0:@[.tlog.roll;::;{[e]`failed}]; h:null .tlog.h; t:.tlog.torn;"
+           ".tlog.open:real;"
+           f"r1:{up};"
+           "-1 .j.j `r0`h`t`r1`rows!(r0;h;t;r1;count trades);")
+    _, err, status = _q(tmp_path, pre=pre)
+    assert status[1] == {"r0": "failed", "h": True, "t": True, "r1": "ok", "rows": 2}, err
+    status, err, _ = _q(tmp_path)
+    assert status["rows"] == 2, err

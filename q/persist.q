@@ -43,8 +43,9 @@ system"mkdir -p /data/logs";
 / succeeds, every upd signals the same way -- and the cut-back, which reads the
 / whole log, is attempted at most every .tlog.retryGap (S4): in between, upd
 / signals without touching the disk. The first attempt is immediate, so a
-/ transient failure costs nothing. The failed handle is nulled (S2), so the
-/ roll and .z.exit can never close an fd q has since reused for a connection.
+/ transient failure costs nothing. The failed handle is nulled here (S2), and
+/ the roll nulls it before reopening (T2), so neither path leaves a closed fd's
+/ number behind for upd, the roll or .z.exit to use after q reuses it.
 .tlog.append:{[x]
   if[.tlog.torn;
     if[.z.p<.tlog.retryAt; '"tlog torn; cut-back retried at most every ",string .tlog.retryGap];
@@ -85,10 +86,14 @@ if[not count trades;
 .tlog.open .z.d;
 
 / roll at UTC date change; prune logs older than 7 days (eod-dump has
-/ flushed them to Delta long since -- and replays them on boot if not)
+/ flushed them to Delta long since -- and replays them on boot if not).
+/ The handle is nulled and the log marked torn BEFORE the reopen (T2): if
+/ .tlog.open fails (ENOSPC on `f set ()`), upd goes through .tlog.append's
+/ throttled reopen of the old day's log, never through a closed fd's number;
+/ a successful .tlog.open clears .tlog.torn.
 .tlog.roll:{
   if[.z.d>.tlog.day;
-    @[hclose;.tlog.h;::]; .tlog.open .z.d;
+    @[hclose;.tlog.h;::]; .tlog.h::0N; .tlog.torn::1b; .tlog.open .z.d;
     old:{x where x<`$"tlog_",string .z.d-7} key .tlog.dir;
     {hdel ` sv .tlog.dir,x} each old]};
 .z.ts:{@[.tlog.roll;::;{-2 "tlog roll failed: ",x;}]};
