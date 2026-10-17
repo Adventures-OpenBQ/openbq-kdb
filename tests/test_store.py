@@ -623,12 +623,12 @@ def test_read_snapshot_ttl_is_judged_against_utc_not_local_wall_clock():
 
 def test_ticks_present_probes_only_the_batch_window_and_cleans_up():
     """The in-doubt probe of live-grid's tick spool (openbq-docker v10)."""
-    s, conn = store_with({"sum (count qwin)": 3})
+    s, conn = store_with({"count each group qwin": 3})
     assert s.ticks_present(_ticks_frame(rows=3)) == 3
     assert "probe_ticks" in conn.data
     probe = next(q for q in conn.queries if "probe_ticks`time" in q)
     assert "within (min probe_ticks`time; max probe_ticks`time)" in probe
-    assert "qwin ? probe_ticks" in probe
+    assert "count each group probe_ticks" in probe and "count each group qwin" in probe
     assert conn.queries[-1] == "delete probe_ticks from `."
     # no parameters: nothing for the lambda-binding rules to bind
     assert all(not args for q, args in conn.calls if "probe_ticks`time" in q)
@@ -640,3 +640,29 @@ def test_ticks_present_of_an_empty_frame_never_dials_q():
     s, conn = store_with()
     assert s.ticks_present(pd.DataFrame(columns=["time", "sym", "price", "size"])) == 0
     assert conn.queries == []
+
+
+def test_the_probe_needs_as_many_twins_as_the_batch_has_copies():
+    """D17 (review 2026-10-16): EODHD repeats byte-identical prints (groups of up to 59), so a
+    batch kdb never applied can have every row's twin in `trades` already. Each probe row must
+    be matched as many times as it occurs in the batch, against distinct rows of `trades`.
+    Runs the probe's own q text on embedded PyKX when it is licensed."""
+    import pytest
+
+    kx = pytest.importorskip("pykx")
+    if not getattr(kx, "licensed", False):
+        pytest.skip("PyKX is unlicensed here")
+    s, conn = store_with({"probe_ticks`time": 0})
+    s.ticks_present(_ticks_frame(rows=1))
+    query = next(q for q in conn.queries if "probe_ticks`time" in q)
+    assert query.startswith("{") and query.endswith("}[]")
+    # The same text with its two globals bound as arguments: no global is assigned, so other
+    # tests' embedded q state is neither needed nor touched.
+    probe = kx.q("{[trades;probe_ticks] " + query[1:-2])
+    row = "`time`sym`price`size!(2026.10.09D14:30:00;`BTC;1f;1f)"
+    other = "`time`sym`price`size!(2026.10.09D14:30:01;`ETH;2f;1f)"
+    held = kx.q(f"2#enlist {row}")
+    assert probe(held, kx.q(f"3#enlist {row}")).py() == 2  # three sent, two held: not all present
+    assert probe(held, kx.q(f"2#enlist {row}")).py() == 2
+    assert probe(held, kx.q(f"(enlist {row}),enlist {other}")).py() == 1
+    assert probe(kx.q(f"0#enlist {row}"), kx.q(f"2#enlist {row}")).py() == 0

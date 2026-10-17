@@ -45,7 +45,8 @@ _READ_PREFIX = "{[qwsym;qwlim] qwlim sublist `time xdesc reverse"
 _AGG_PREFIX = "{[qwsym;qwlo;qwhi;qwbucket]"
 _PROBE = ("{qwin: select time, sym, price, size from trades"
           " where time within (min probe_ticks`time; max probe_ticks`time);"
-          " sum (count qwin) > qwin ? probe_ticks}[]")
+          " qwp: count each group probe_ticks;"
+          " $[count qwin; sum (value qwp) & 0^(count each group qwin) key qwp; 0]}[]")
 
 
 class QDown(ConnectionError):
@@ -205,8 +206,11 @@ class SimConn:
             probe["time"] = pd.to_datetime(probe["time"]).astype("datetime64[ns]")
             lo, hi = probe["time"].min(), probe["time"].max()
             held = p.trades[(p.trades["time"] >= lo) & (p.trades["time"] <= hi)]
-            keys = set(map(tuple, held[["time", "sym", "price", "size"]].itertuples(index=False)))
-            return _K(sum(1 for row in probe.itertuples(index=False) if tuple(row) in keys))
+            # a multiset match, as the q does: each row at most as often as the window holds it
+            from collections import Counter
+            have = Counter(map(tuple, held[["time", "sym", "price", "size"]].itertuples(index=False)))
+            want = Counter(map(tuple, probe.itertuples(index=False)))
+            return _K(sum(min(n, have[row]) for row, n in want.items()))
         if query == "delete probe_ticks from `.":
             self.globals.pop("probe_ticks", None)
             return _K(None)

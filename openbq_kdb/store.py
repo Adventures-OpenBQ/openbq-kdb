@@ -289,8 +289,14 @@ class KdbStore:
         Only the time window the batch spans is searched (`within` on the
         batch's own min and max), so the cost is proportional to the ticks in
         that window, not the whole day. A probe sent to a q whose `trades` is
-        empty answers 0. Rows are found with q's table find (`qwin ? probe`): the
-        index of each probe row in the window, or `count qwin` when absent.
+        empty answers 0. Rows are counted as a multiset (D17, review 2026-10-16):
+        each distinct probe row counts at most as many times as the window holds
+        it (`count each group` on both sides, the smaller of the two). EODHD
+        repeats byte-identical prints, so a plain find (`qwin ? probe`) said
+        "present" for a batch kdb never applied whenever each row had one twin.
+        The case that remains: a run of repeats split across two batches, the
+        earlier applied and holding at least as many copies as the in-doubt one.
+        Only a batch id in `trades` would close that.
         """
         if frame is None or getattr(frame, "empty", True):
             return 0
@@ -302,7 +308,8 @@ class KdbStore:
                 found = conn(
                     "{qwin: select time, sym, price, size from trades"
                     " where time within (min probe_ticks`time; max probe_ticks`time);"
-                    " sum (count qwin) > qwin ? probe_ticks}[]"
+                    " qwp: count each group probe_ticks;"
+                    " $[count qwin; sum (value qwp) & 0^(count each group qwin) key qwp; 0]}[]"
                 ).py()
             finally:
                 conn("delete probe_ticks from `.")
