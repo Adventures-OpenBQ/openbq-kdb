@@ -84,6 +84,11 @@ _INIT_SCHEMA = (
 class KdbStore:
     """Typed access to the cache's q state."""
 
+    def __new__(cls, session):
+        if cls is KdbStore and getattr(session, "secured", False):
+            return super().__new__(NamedKdbStore)
+        return super().__new__(cls)
+
     def __init__(self, session):
         self.session = session
         self._schema_conn = None  # the connection object last initialised
@@ -609,3 +614,143 @@ def _q_timestamp(value: datetime):
     import pykx as kx
 
     return kx.TimestampAtom(value)
+
+
+class NamedKdbStore(KdbStore):
+    """Secured store: every request is a declared operation; no expression fallback."""
+
+    def _conn(self):
+        raise RuntimeError('secured store cannot initialize or evaluate remote schema')
+
+    def _named(self, operation, *args, frame=False):
+        return self.session.rpc(operation, *args, convert='pd' if frame else 'py')
+
+    def memory(self):
+        return dict(self._named('memory'))
+
+    def read_bars(self, symbol, interval, start, end):
+        import pandas as pd
+        out = self.session.run(lambda: self._named('readBars', symbol, interval,
+                                                   _q_timestamp(start), _q_timestamp(end),
+                                                   frame=True))
+        return out if isinstance(out, pd.DataFrame) else pd.DataFrame()
+
+    def write_bars(self, symbol, interval, df):
+        def write():
+            prototype = self._named('barPrototype', symbol, interval, frame=True)
+            incoming = _conform_dtypes(df, prototype)
+            return self._named('writeBars', symbol, interval, incoming)
+        self.session.run(write)
+
+    def read_coverage(self, symbol, interval):
+        rows = self._named('readCoverage', symbol, interval)
+        if not rows:
+            return []
+        return list(zip(rows['s'], rows['e'])) if isinstance(rows, dict) else [tuple(r) for r in rows]
+
+    def record_coverage(self, symbol, interval, r):
+        self.session.run(lambda: self._named('recordCoverage', symbol, interval,
+                                             _q_timestamp(r[0]), _q_timestamp(r[1])))
+
+    def touch(self, symbol, interval):
+        self._named('touch', symbol, interval)
+
+    def drop(self, symbol, interval):
+        self._named('drop', symbol, interval)
+
+    def evict_until_below(self, budget_bytes):
+        evicted = []
+        heap = self.memory().get('heap', 0)
+        if heap <= budget_bytes:
+            return evicted
+        rows = self._named('lruRows') or {}
+        ordered = sorted(zip(rows.get('sym', []), rows.get('iv', []), rows.get('atime', [])),
+                         key=lambda row: row[2])
+        for symbol, interval, _ in ordered:
+            symbol = symbol.decode() if isinstance(symbol, bytes) else str(symbol)
+            interval = interval.decode() if isinstance(interval, bytes) else str(interval)
+            prototype = self._named('barPrototype', symbol, interval, frame=True)
+            existed = hasattr(prototype, 'columns')
+            self.drop(symbol, interval)
+            if existed:
+                evicted.append(self.table_name(symbol, interval))
+            heap = self.memory().get('heap', 0)
+            if heap <= budget_bytes:
+                return evicted
+        logger.warning('evict_until_below exhausted the LRU without reaching budget '
+                       '(heap=%s budget=%s)', heap, budget_bytes)
+        return evicted
+
+    def _tick_batch(self, operation, frame):
+        if frame is None or getattr(frame, 'empty', True):
+            return 0
+        def send():
+            prototype = self._named('tickPrototype', frame=True)
+            return int(self._named(operation, _conform_dtypes(frame, prototype)))
+        return self.session.run(send)
+
+    def write_ticks(self, frame):
+        return self._tick_batch('writeTicks', frame)
+
+    def ticks_present(self, frame):
+        return self._tick_batch('ticksPresent', frame)
+
+    def prune_ticks(self, cutoff):
+        return self.session.run(lambda: int(self._named('pruneTicks', _q_timestamp(cutoff))))
+
+    def tick_span(self, symbol):
+        got = self._named('tickSpan', symbol, frame=True)
+        if got is None or got.empty:
+            return None
+        return tuple(got[col].iloc[0].to_pydatetime() for col in ('lo', 'hi'))
+
+    def latest_tick(self, symbol):
+        got = self._named('latestTick', symbol, frame=True)
+        if got is None or got.empty:
+            return None
+        row = got.iloc[-1]
+        return dict(time=row['time'].to_pydatetime(), price=float(row['price']), size=float(row['size']))
+
+    def read_ticks(self, symbol, limit):
+        if limit <= 0:
+            return []
+        got = self._named('readTicks', symbol, limit, frame=True)
+        return [dict(time=row['time'].to_pydatetime(), price=float(row['price']),
+                     size=float(row['size'])) for _, row in got.iterrows()]
+
+    def aggregate_frame(self, symbol, interval, start, end):
+        from openbq_kdb.aggregate import bucket_ns
+        return self.session.run(lambda: self._named('aggregateFrame', symbol,
+                                                    _q_timestamp(start), _q_timestamp(end),
+                                                    bucket_ns(interval), frame=True))
+
+    def write_snapshot(self, symbol, payload):
+        import json
+        self._named('writeSnapshot', symbol, json.dumps(payload))
+
+    def read_snapshot(self, symbol, max_age):
+        import json
+        import pandas as pd
+        got = self._named('readSnapshot', symbol, frame=True)
+        if got is None or got.empty:
+            return None
+        fetched = pd.Timestamp(got['fetched'].iloc[0])
+        if pd.isna(fetched):
+            return None
+        fetched = fetched.tz_localize('UTC') if fetched.tzinfo is None else fetched.tz_convert('UTC')
+        if (pd.Timestamp.now(tz='UTC') - fetched).total_seconds() > max_age:
+            return None
+        payload = got['payload'].iloc[0]
+        return json.loads(payload.decode() if isinstance(payload, bytes) else payload)
+
+    def stream_status(self):
+        from openbq_kdb.protocol import chart_result
+        return chart_result(self._named('streamStatus'))
+
+    def read_chart_snapshot(self, view):
+        from openbq_kdb.protocol import chart_result
+        return chart_result(self._named('readChartSnapshot', view))
+
+    def read_chart_changes(self, cursor, view):
+        from openbq_kdb.protocol import chart_result
+        return chart_result(self._named('readChartChanges', cursor, view))

@@ -1,8 +1,33 @@
 {
   "protocol_version": 1,
-  "stage": "qualification",
+  "stage": "named-data-and-chart-source",
   "implemented_capabilities": [
-    "ping"
+    "ping",
+    "memory",
+    "barPrototype",
+    "tickPrototype",
+    "readBars",
+    "writeBars",
+    "readCoverage",
+    "recordCoverage",
+    "touch",
+    "drop",
+    "lruRows",
+    "writeTicks",
+    "ticksPresent",
+    "pruneTicks",
+    "tickSpan",
+    "latestTick",
+    "readTicks",
+    "aggregateFrame",
+    "writeSnapshot",
+    "readSnapshot",
+    "dayCount",
+    "daySlice",
+    "streamStatus",
+    "readChartSnapshot",
+    "readChartChanges",
+    "chart_stream_v1"
   ],
   "wire": {
     "dispatcher": ".openbq.rpc",
@@ -21,7 +46,12 @@
       "query_timeout_seconds": 5
     },
     "integer_wire": "decimal int64 strings for browser cursors/counters; q long for native operation args",
-    "max_sequence": "9223372036854775807"
+    "max_sequence": "9223372036854775807",
+    "canonical_args": {
+      "readChartSnapshot": "one-row table of the view dictionary (q canonical singleton dictionary list)",
+      "pruneTicks": "singleton timestamp vector",
+      "dayCount": "two-element timestamp vector"
+    }
   },
   "roles": {
     "query": [
@@ -97,7 +127,7 @@
     "memory": {
       "args": [],
       "result": "dictionary(used,heap,peak,wmax,mphy:long)",
-      "implemented": false
+      "implemented": true
     },
     "barPrototype": {
       "args": [
@@ -105,12 +135,12 @@
         "interval:string"
       ],
       "result": "empty bar table; empty general list if absent",
-      "implemented": false
+      "implemented": true
     },
     "tickPrototype": {
       "args": [],
       "result": "empty table(time:timestamp,sym:symbol,price:float,size:float)",
-      "implemented": false
+      "implemented": true
     },
     "readBars": {
       "args": [
@@ -120,7 +150,7 @@
         "end:timestamp"
       ],
       "result": "bar table; inclusive endpoints",
-      "implemented": false
+      "implemented": true
     },
     "writeBars": {
       "args": [
@@ -129,7 +159,7 @@
         "rows:table"
       ],
       "result": "generic null; existing t-keyed upsert semantics",
-      "implemented": false
+      "implemented": true
     },
     "readCoverage": {
       "args": [
@@ -137,7 +167,7 @@
         "interval:string"
       ],
       "result": "table(s:timestamp,e:timestamp)",
-      "implemented": false
+      "implemented": true
     },
     "recordCoverage": {
       "args": [
@@ -147,7 +177,7 @@
         "end:timestamp"
       ],
       "result": "generic null",
-      "implemented": false
+      "implemented": true
     },
     "touch": {
       "args": [
@@ -155,7 +185,7 @@
         "interval:string"
       ],
       "result": "generic null",
-      "implemented": false
+      "implemented": true
     },
     "drop": {
       "args": [
@@ -163,47 +193,47 @@
         "interval:string"
       ],
       "result": "generic null; cache tables only",
-      "implemented": false
+      "implemented": true
     },
     "lruRows": {
       "args": [],
       "result": "table(sym:symbol,iv:symbol,atime:timestamp)",
-      "implemented": false
+      "implemented": true
     },
     "writeTicks": {
       "args": [
         "rows:table"
       ],
       "result": "long accepted row count; one unchanged acknowledgment unit",
-      "implemented": false
+      "implemented": true
     },
     "ticksPresent": {
       "args": [
         "rows:table"
       ],
       "result": "long multiset matched row count",
-      "implemented": false
+      "implemented": true
     },
     "pruneTicks": {
       "args": [
         "cutoff:timestamp"
       ],
       "result": "long rows remaining",
-      "implemented": false
+      "implemented": true
     },
     "tickSpan": {
       "args": [
         "symbol:string"
       ],
       "result": "table(lo:timestamp,hi:timestamp), zero rows if absent",
-      "implemented": false
+      "implemented": true
     },
     "latestTick": {
       "args": [
         "symbol:string"
       ],
       "result": "table(time:timestamp,price:float,size:float), zero rows if absent",
-      "implemented": false
+      "implemented": true
     },
     "readTicks": {
       "args": [
@@ -211,7 +241,7 @@
         "limit:long"
       ],
       "result": "table(time:timestamp,price:float,size:float), newest first",
-      "implemented": false
+      "implemented": true
     },
     "aggregateFrame": {
       "args": [
@@ -221,7 +251,7 @@
         "bucket_ns:long"
       ],
       "result": "unkeyed table(t:timestamp,open,high,low,close,volume,vwap:float)",
-      "implemented": false
+      "implemented": true
     },
     "writeSnapshot": {
       "args": [
@@ -229,14 +259,14 @@
         "payload_json:string"
       ],
       "result": "generic null",
-      "implemented": false
+      "implemented": true
     },
     "readSnapshot": {
       "args": [
         "symbol:string"
       ],
       "result": "table(fetched:timestamp,payload:string); client checks UTC TTL",
-      "implemented": false
+      "implemented": true
     },
     "dayCount": {
       "args": [
@@ -244,7 +274,7 @@
         "end:timestamp"
       ],
       "result": "long; half-open [start,end)",
-      "implemented": false
+      "implemented": true
     },
     "daySlice": {
       "args": [
@@ -254,7 +284,7 @@
         "limit:long"
       ],
       "result": "table(time:timestamp,sym:symbol,price:float,size:float); half-open",
-      "implemented": false
+      "implemented": true
     },
     "readDiagnostics": {
       "args": [
@@ -266,15 +296,15 @@
     },
     "streamStatus": {
       "args": [],
-      "result": "dictionary(epoch,low_cursor,high_cursor,coverage,limits)",
-      "implemented": false
+      "result": "dictionary(epoch,low_cursor,high_cursor,current_cursor,coverage,clock,limits); clock UTC ISO nanoseconds string",
+      "implemented": true
     },
     "readChartSnapshot": {
       "args": [
         "view:dictionary"
       ],
       "result": "dictionary(view,cursor,view_floor,coverage,truncated,items)",
-      "implemented": false
+      "implemented": true
     },
     "readChartChanges": {
       "args": [
@@ -282,7 +312,7 @@
         "view:dictionary"
       ],
       "result": "dictionary(from_cursor,through_cursor,batches|candles,unavailable_buckets,coverage) or resync_required",
-      "implemented": false
+      "implemented": true
     }
   },
   "limits": {
@@ -365,5 +395,8 @@
     "p95_accept_to_model_ms": 250,
     "max_p95_ingestion_regression_percent": 10
   },
-  "status": "Only ping is executable in this stage. All other operations and chart frames are frozen contracts, not advertised implementation."
+  "status": "Qualification mode implements ping only. Tickplant mode implements declared named data/chart operations and chart_stream_v1. Diagnostics remains unavailable. Platform/performance qualification is separate.",
+  "qualification_capabilities": [
+    "ping"
+  ]
 }

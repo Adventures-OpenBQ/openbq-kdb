@@ -1,190 +1,150 @@
-# OpenBQ q protocol v1 — qualification contract
+# OpenBQ q protocol v1
 
-Backend target: v10. Charts/v12 consumes this API later, after the data and
-subscription operations are implemented. This stage implements **ping only**;
-it does not change v10's running session, recorder, exports or Compose stack.
+The packaged [manifest](../openbq_kdb/resources/protocol-v1.json) declares the
+named operations, role unions, argument/result shapes and limits. The shared
+[browser schema](../openbq_kdb/resources/chart-stream-v1.schema.json) and
+[golden transcripts](../openbq_kdb/resources/chart-stream-v1.examples.json)
+remain the browser contract. A source API does not establish WebSocket,
+rendering, deployment or load qualification.
 
-The normative machine manifest is
-[`protocol-v1.json`](../openbq_kdb/resources/protocol-v1.json).
-Browser structural schemas and golden transcripts are
-[`chart-stream-v1.schema.json`](../openbq_kdb/resources/chart-stream-v1.schema.json)
-and [`chart-stream-v1.examples.json`](../openbq_kdb/resources/chart-stream-v1.examples.json).
-They are packaged in the wheel so later Python and TypeScript consumers can
-pin identical bytes. Golden transcripts are specification examples, not proof
-that the future chart data path already works.
+## Local startup and authenticated transport
 
-## Native envelope and qualification
+Use `python -m openbq_kdb.bootstrap --q /absolute/path/to/q --port 5000
+--bind 0.0.0.0 --mode tickplant --data-dir /data`. `--bind` defaults to loopback;
+keep q on the private service network. `--workspace-mb` optionally sets q workspace containment and is preserved by
+spawned KdbSession. Tickplant requires an explicit local data directory; logs remain in `DATA_DIR/logs/tlog_YYYY.MM.DD` with the existing
+binary message format. `--mode qualification` without a data directory retains
+the ping-only qualification endpoint. Supplying `--data-dir` enables the full
+data source for compatibility with qualification harnesses. No browser talks
+directly to q.
 
-The q IPC message is exactly a general list:
+The launcher uses only Python's standard library. It validates and snapshots the
+password/role files, starts q with `-p 0 -U PASSWORD_FILE`, loads trusted local
+assets, then opens the configured listener. `--init-script` is an optional
+operator-controlled local file, never an RPC argument. Failures before readiness
+exit nonzero without opening the port. No network console, HTTP evaluator or
+WebSocket evaluator is installed. Both synchronous and asynchronous IPC use the
+same exact envelope validator. Async errors are contained; they do not replace
+handlers. Native `-U` authenticates the token before `.z.pw` checks readiness and
+principal membership, and prevents hook removal through `\x`.
 
-```
-(`.openbq.rpc; `ping; (); "request-id")
-```
+`KDB_AUTH_PASSWORDS_FILE` is a regular permission-restricted file, at most 64 KiB,
+containing `identity:token` lines. Tokens have 32–256 `[A-Za-z0-9_-]` characters;
+operators generate random machine tokens. One final newline is accepted. Empty
+lines, duplicate identities and malformed tokens fail closed. POSIX group/other
+permissions are forbidden. `KDB_AUTH_ROLES_FILE` contains exactly
+`{"schema_version":1,"principals":{"identity":["role"]}}`; principal sets must
+match, repeated JSON keys and unknown/duplicate roles are rejected. Identities
+match `[A-Za-z][A-Za-z0-9_.-]{0,63}`. No secrets are created by the launcher.
 
-The first two values are **symbol atoms**, not q expression strings. Arguments
-are a general list even when empty. Request ID is an ASCII character vector of
-1–128 bytes. No input is passed to `value`, `eval`, or a client-selected
-function lookup. In this stage arguments must be empty and operation must be
-`ping`; data-operation names in the manifest are unavailable until later tasks.
+Clients use process-owned `KDB_USERNAME` and `KDB_PASSWORD_FILE`. Either variable
+selects secured mode, and incomplete/invalid configuration fails closed. The
+secret file contains one token with an optional final newline. KdbSession loads
+it once and uses authenticated qualification for every endpoint/reconnect, with
+no expression fallback. Authentication, authorization and protocol failures are
+classified with safe stable exception codes and stop endpoint selection
+immediately; only transport failures enter the ordinary backoff/bypass path. Unconfigured sessions retain v10 legacy behavior.
 
-PyKX 4.2.0 serializes the intended envelope with:
+## Native envelope and owner-thread client
 
-```python
-conn(kx.SymbolAtom(".openbq.rpc"), kx.SymbolAtom("ping"),
-     kx.List([]), kx.CharVector("handshake"), debug=False, skip_debug=True)
-```
+The native envelope is `(`.openbq.rpc; `operation; args; "request-id")`, with
+symbol atoms in its first two positions. Arguments are data, never expressions.
+The request ID is an ASCII char vector of 1–128 bytes. Operation membership,
+principal role grants, arity and per-operation payload types/limits are checked
+before work. The fixed handler registry is created locally; there is no remote
+registration, setter, table-name selector, `value`, `eval` or source argument.
+Schema/prototypes are created locally before listening.
 
-Use `SyncQConnection(no_ctx=True, reconnection_attempts=-1, ...)`. The default
-context-enabled constructor sends anonymous context-inspection expressions and
-is incompatible with the restricted endpoint. Debug wrapping also changes the
-message shape; disable it. The supplied `connect_qualified` helper verifies a
-ready v1 response and closes on mismatch, without probing another endpoint or
-downgrading to expression execution. This helper must run on the existing
-session owner thread when integrated in task 3.
+q canonicalizes a homogeneous list: a singleton view dictionary becomes a
+one-row table, and timestamp-only arguments become a timestamp vector. Those
+canonical forms are admitted **only** for `readChartSnapshot`, `pruneTicks` and
+`dayCount`, at their declared arity and with full semantic validation. Other
+operations still require a general list. This narrow exception is not a remote
+query/table execution path.
 
-`ping` returns q dictionary `protocol_version=1i`, `ready=1b`, and a symbol vector
-of actually implemented capabilities (`ping` only now). The qualification helper
-is intentionally stage-specific; capability expansion and role checks accompany
-the later full client migration. Never advertise chart_stream_v1 now.
+`connect_qualified` uses `SyncQConnection(no_ctx=True,
+reconnection_attempts=-1, connection_timeout=5, timeout=5)` and symbolic ping
+with `debug=False, skip_debug=True`. Context introspection and debug expression
+wrappers are incompatible with this endpoint. The handshake requires v1, ready
+true and a unique textual capability list containing ping; it accepts expanded
+capabilities. `KdbSession.capabilities` is empty before qualification and contains
+the peer's advertised capability set afterward. `session.rpc(operation,*args)`
+constructs arguments and converts replies on the permanent owner thread.
+KdbStore selects NamedKdbStore in secured mode; no schema expressions or temporary
+remote variables are sent. Chart methods return JSON-like Python dictionaries,
+including recursive UTF-8 text decoding and q table-to-record-list conversion.
 
-## Credentials and startup
+## Named data and accepted chart source
 
-`KDB_AUTH_PASSWORDS_FILE` names a regular, permission-restricted file, at most
-64 KiB, with one `user:token` per line. A single final newline is accepted; blank
-lines, duplicate identities, colons in tokens and malformed lines are rejected.
-Tokens are 32–256 characters from `[A-Za-z0-9_-]`, intended to be randomly
-generated machine tokens. Length alone is not an entropy test. POSIX secret
-files must grant no group/other permissions. No credentials are created for
-operators by the test harness; tests generate and destroy disposable values.
+Tick writes/probes permit one batch of up to 100,000 rows. The exact schema is
+`time:timestamp,sym:symbol,price:float,size:float`; public/exported trades retain
+these four columns. Multiset probes count matching occurrences, preserving v10's
+uncertain-write spool behavior. A successful probe does not accept another
+batch or advance chart sequence. Existing cache dtype conformity and inclusive
+bar/coverage endpoints remain; chart/EOD end bounds are exclusive. Bars permit
+100,000 rows, 128 primitive data columns, 8 MiB encoded payload. Executable and
+nested provider columns are rejected. Columns beginning `qw` are reserved to
+prevent q SQL parameter shadowing. REST JSON is capped at 64 KiB; tick reads at
+1,000 rows; EOD slices at 250,000 within one day. Diagnostics is not implemented
+or advertised in this milestone.
 
-`KDB_AUTH_ROLES_FILE` contains exactly `schema_version:1` and `principals`, an
-object mapping identities to nonempty unique arrays of known roles. The identity
-sets must match the password file. Repeated JSON keys, unknown roles, extra
-top-level keys and malformed values fail closed. Identity syntax is
-`[A-Za-z][A-Za-z0-9_.-]{0,63}`. Role unions and future operation grants are in the
-manifest. The current server permits authenticated ping for every configured
-identity; it does not pretend to enforce yet-unimplemented operations.
+Persistence retains append-before-apply semantics, torn-tail repair and daily
+roll from v10. Trusted boot replay temporarily uses the local replay handler
+before networking is possible; authentication applies only to network ingress.
+The private stream records accepted batches only after durable append and public
+apply. A fresh nondeterministic epoch is generated after every restart; replayed
+rows receive new-epoch identities without changing the binary logs.
 
-Clients use process-owned `KDB_USERNAME` and `KDB_PASSWORD_FILE`; per-request
-credentials do not select identities. Client files accept exactly one token
-with an optional single final newline. Secret values are omitted from object
-reprs and configuration errors. This loader is not yet wired into legacy v10
-KdbConfig/KdbSession.
+`streamStatus()` returns `epoch`, `low_cursor`, `high_cursor`, `current_cursor`
+(an alias of high), `coverage`, server `clock` and `limits`.
+`readChartSnapshot(view)` returns `view,cursor,view_floor,coverage,truncated,items`.
+`readChartChanges(cursor,view)` returns
+`from_cursor,through_cursor,coverage,unavailable_buckets,batches|candles`, or
+`reason,current_cursor,coverage` for an explicit reset. Cursors and candle
+revisions are `{epoch,seq}`; sequence values and tickCount are decimal strings.
+Every chart time is UTC ISO with nine fractional digits, produced in q before
+PyKX conversion. Candle items and tick items match the shared structural schema.
 
-The opt-in launcher is `python -m openbq_kdb.bootstrap --q /absolute/path/to/q
---port PORT`. It snapshots the validated credentials/policy into an owner-only
-temporary directory, starts q with `-p 0 -U PASSWORD_FILE`, and opens loopback
-only after trusted local initialization and handler installation succeed. Its
-optional `--init-script` is an operator-controlled local file, never a remote
-RPC parameter. There is no console on a network listener and no unrestricted
-fallback. Failure of local initialization exits nonzero without opening the
-port. The wrapper forwards termination and cleans up its owned child and
-temporary credentials.
+Snapshots capture data and H in one q turn, order ticks by `(event_time,seq)`,
+and retain the newest max_items (10,000 ticks/2,000 candles) within an 8 MiB
+logical response budget. A truncated view reports the first retained key as its
+floor; an untruncated view keeps the requested start. HOST preserves per-view
+floors during subsequent merges and handles view-key/checkpoint binding.
+Accepted changes retain original batch identity, preserve duplicate occurrences,
+and scan the entire global (C,H] interval even when symbols filter all rows out.
+A response never pages part of an interval while aggregating future ticks.
+Late ticks return full touched-candle replacements at response H; equal-time
+open/close uses accepted sequence as the tie-break. Closed candles remain
+revisable. Clock/status transitions are handled by HOST without fabricated ticks.
 
-q's native `-U` verifies the token before `.z.pw` checks readiness and membership.
-It also prevents hook deletion via `\\x`. No `-u 1` is added: its effect on remote
-contexts performing legitimate tick-log file writes needs task-2 qualification.
-HTTP GET/POST/other methods and WebSocket upgrades are denied in this minimal
-qualification mode, even with valid HTTP Basic credentials. Future tick-plant
-handlers require separate authenticated transport qualification.
+The accepted ring retains at most 1,000,000 rows, 128 MiB and 60 seconds. A
+conservative 128-byte/row charge covers its bounded symbol/numeric payload
+without serializing the whole ring during ingestion. Catch-up scans at most
+100,000 accepted rows and returns explicit reset when the response cannot fit.
+Epoch changes, expired/ahead cursors, catch-up excess and pruning coverage loss
+reset explicitly. Pruning aligns private identity metadata with the four-column
+public table. Cursors predating a prune reset; fresh snapshots advance their
+effective floor and continue using the original requested view. Partial pruned
+candle buckets are omitted and late revisions report unavailable bucket keys.
+A private-stream apply failure after durable public apply marks the server
+unready and exits; restart reconstructs coherent metadata from the old log.
+Coverage is always marked incomplete: retained ticks are not proof that an
+upstream provider supplied every trade. No continuous-market completeness is
+inferred from an empty result.
 
-## Data operations reserved for later tasks
+## Qualification limits
 
-The manifest fixes every operation's positional arguments, q result shape,
-roles and proposed bounds, including prototypes, bars/coverage/LRU, tick writes,
-multiset probes/pruning, REST snapshots, EOD chunks, diagnostics and chart reads.
-Timestamps are native q timestamp atoms for native RPC. Existing bar reads and
-coverage use inclusive endpoints; EOD and chart view end times are exclusive.
-No operation accepts arbitrary table names or executable source.
+Native macOS arm64 KDB-X/PyKX socket tests cover authenticated operations,
+expression denial, cache/tick/export paths, duplicate identities, filtered
+progress, late candle revisions, expiry/pruning, restart/replay and secured
+owner-thread session/store integration. Existing simulation/regression tests
+remain useful but do not establish Linux deployment safety. Linux amd64/arm64,
+full slow-browser transport, rendered chart and normal-load latency gates remain
+separate qualification. The 10 ms q-call target and <=10% p95 ingestion regression
+are targets, not measured claims in this milestone.
 
-Tick writes/probes preserve the existing 100,000-row maximum live batch and
-5,000-row replay acknowledgment units; no partial batch splitting occurs in
-KdbStore. Bar payloads allow at most 100,000 rows, 128 columns, and 8 MiB of
-encoded payload; dynamic provider columns require a data-only type validator in
-task 2. REST snapshot JSON is at most 64 KiB. EOD slices are at most 250,000 rows
-within one UTC day. Limit/schema errors must be rejected before mutation.
-Zero rows are a legitimate result, not evidence of complete provider coverage.
-
-## Browser stream contract reserved for charts/v12
-
-`/chart_stream_ws` is an authenticated live-grid/gateway endpoint, not public q.
-It is distinct from legacy coalesced quote rows and TA figure/delta sockets.
-Authentication and symbol access are checked on each admission/resume; a cursor
-does not grant access. Fresh single-use gateway tickets are required per socket.
-The selected HOST exposes ticket minting through `/grid/ws_ticket`; its current
-socket allowlist does not yet admit the proposed endpoint.
-
-The schema defines subscribe/resume/ack/unsubscribe/pong and snapshot begin,
-chunks/end, ticks, candles, candle_status, resumed, resync_required, heartbeat,
-unsubscribed and error. All frames carry protocol_version=1 and subscription_id;
-post-admission frames carry an opaque generation, fresh on each admission.
-Client controls carry request_id. Decimal strings encode sequences/counters;
-consumers must additionally enforce int64 range, ordering and generation/epoch
-binding. The structural JSON schema alone is not a state-machine validator.
-
-Cursors are `{epoch,seq}`; tick IDs use the same shape, even for byte-identical
-trades. Native restart creates a new epoch; binary logs do not change. Snapshot
-and watermark H come from one q turn; readChartChanges scans the full retained
-interval to H or returns resync_required. There is no partial-interval candle
-aggregate at a later watermark. A bounded accepted-data buffer retains at most
-1,000,000 ticks/128 MiB/60 seconds; chart reads scan at most 100,000 accepted rows
-per call. Backlogs exceeding that scan cap resync. The 10 ms per-call work target
-is a measured admission/qualification target, not a hard q preemption promise.
-
-Snapshot caps: 10,000 ticks or 2,000 candles, 8 MiB per logical response and
-512 KiB per snapshot chunk, counting envelopes. The atomic model is installed
-only at snapshot_end. `view_floor` is `{"kind":"tick","time":UTC,"seq":SEQ|null}`
-or `{"kind":"candle","bucket_start":UTC}`. Preserve it with cursor/view_key in
-the checkpoint; spare max_items capacity after byte truncation does not permit
-older omitted history to reappear. Merge and trim newest items while the floor
-only advances. `view_key` is SHA-256 of UTF-8 JSON for the normalized view with
-sorted keys, no whitespace, ASCII escaping, explicit normalized defaults;
-timestamps normalize to UTC with nine fractional digits. Missing end stays
-absent, ticks omit interval, and supplied values override max_items defaults
-(10,000 ticks/2,000 candles) before hashing. This is specification binding, not
-a signature. Golden examples contain normalized views and their actual hashes;
-task 6 must consume these same fixtures when implementing normalization.
-
-Changes carry from_cursor/through_cursor so interleaved symbols and empty
-filtered intervals advance coherently. Partial overlap applies only unseen
-tick IDs/newer candle revisions. A forward hole, expired/ahead/wrong-epoch
-cursor, unavailable coverage, wrong view, oversized catch-up or slow consumer
-requires explicit reset. Ack means fully applied model progress. Quiet markets
-may send empty progress frames, never fabricated trades.
-
-Full candle replacements use key `(symbol,interval,bucket_start)`, revision H,
-server-calculated OHLCV/VWAP/tickCount, and open/closed status. Late ticks revise
-old buckets. Equal event times tie-break by accepted sequence. Never add
-replacement volume to previous volume. Status-only transitions use status_seq,
-reset each generation, and do not advance data cursor. Resume includes an
-authoritative status baseline for every retained candle key in the checkpoint,
-even with no new trades. Status changes do not conflict with equal data revisions.
-
-Per-connection pending bytes (unsent plus unacknowledged, including transport
-buffers and staged snapshots) are capped at 8 MiB or 100 messages; process-wide
-pending bytes at 128 MiB, with 64 connections and 8 subscriptions/connection.
-Control messages: 64 KiB and 10/second/connection. Each connection reserves part
-of its budget for bounded control output; no unlimited heartbeat queue. Send
-deadline is 5 seconds; pending-data application progress and heartbeat liveness
-must be demonstrated within 15 seconds. On overload, reset explicitly or close
-4009 when reset cannot be delivered; never block q ingestion behind a browser.
-Reconnect uses jittered 0.5–15 second backoff, reset after 30 stable seconds.
-
-## Runtime resource limits and remaining qualification
-
-Application validation happens after q deserialization. q's documented `.z.bm`
-reports malformed IPC structures; it is not a preallocation byte ceiling or
-application authorization hook. No total deserialization-allocation bound has
-been qualified here. Keep controlled machine credentials, private networking
-and runtime/container memory containment; do not advertise an untrusted sandbox.
-References: [KX callback behavior](https://code.kx.com/q/ref/dotz/) and
-[native password files](https://code.kx.com/q/basics/cmdline/).
-
-The frozen normal-load fixture is 4 symbols, 1,000 ticks/second aggregate,
-250 ms flushes (250-row normal batches), 8 responsive clients with one view each,
-10 seconds warmup and 60 seconds measured duration. Final targets remain p95
-accept-to-model <=250 ms and <=10% ingestion p95 regression. The native 100,000-row
-scan/aggregation proxy informs the 10 ms work target, but does not establish
-serialization, retention-buffer, concurrent-client or full chart API performance.
-Both Linux architectures, full role/data API, persistence integration, slow
-clients and rendered charts/v12 remain later qualification gates.
+Application limits apply after IPC deserialization; no preallocation bound is
+claimed. Keep controlled machine credentials, private networking and runtime
+memory containment. [KX callback documentation](https://code.kx.com/q/ref/dotz/)
+and [native password files](https://code.kx.com/q/basics/cmdline/) describe the
+runtime transport mechanisms.

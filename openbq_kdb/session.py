@@ -33,6 +33,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from openbq_kdb.config import KdbConfig
+from openbq_kdb.protocol import KdbAuthenticationError, KdbAuthorizationError, KdbProtocolError
+
+_POLICY_FAILURES = (KdbAuthenticationError, KdbAuthorizationError, KdbProtocolError)
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +129,11 @@ class KdbSession:
 
     def __init__(self, config: KdbConfig, clock=time.monotonic):
         self.config = config
+        import os
+        from openbq_kdb.credentials import load_client_credentials
+        self.secured = bool(os.environ.get("KDB_USERNAME") or os.environ.get("KDB_PASSWORD_FILE"))
+        self._credentials = load_client_credentials() if self.secured else None
+        self.capabilities: frozenset[str] = frozenset()
         # Injected for the backoff tests; production uses time.monotonic.
         self._clock = clock
         # Consecutive failed connects since the last success (drives the backoff).
@@ -170,6 +178,14 @@ class KdbSession:
     def _q_argv(self) -> list[str]:
         """Argument vector for the q server."""
         cfg = self.config
+        if self.secured:
+            import os
+            import sys
+            return [sys.executable, "-m", "openbq_kdb.bootstrap", "--q",
+                    f"{cfg.local_qhome}/bin/q", "--port", str(cfg.port),
+                    "--bind", cfg.bind_host, "--mode", "tickplant",
+                    "--workspace-mb", str(cfg.q_workspace_mb), "--data-dir",
+                    os.environ.get("KDB_DATA_DIR", f"{cfg.local_qhome}/data")]
         return [
             f"{cfg.local_qhome}/bin/q",
             "-p", f"{cfg.bind_host}:{cfg.port}",
@@ -250,6 +266,11 @@ class KdbSession:
         """
         import pykx as kx
 
+        if self.secured:
+            from openbq_kdb.protocol import connect_qualified, named_call, validate_handshake
+            conn = connect_qualified(host or "127.0.0.1", self.config.port, self._credentials)
+            self.capabilities = validate_handshake(named_call(conn, "ping").py())
+            return conn
         return kx.SyncQConnection(
             host or "127.0.0.1", self.config.port, connection_timeout=_CONNECT_BUDGET_S
         )
@@ -269,10 +290,20 @@ class KdbSession:
                 raise OSError(f"q exited immediately: {out}")
             try:
                 return self._connect()
+            except _POLICY_FAILURES:
+                raise
             except Exception:
                 if self._proc is None or time.monotonic() >= deadline:
                     raise
                 time.sleep(_CONNECT_POLL_INTERVAL_S)
+
+    def rpc(self, operation: str, *args, convert="py"):
+        """Call a named operation and convert its result on the q owner thread."""
+        def invoke():
+            from openbq_kdb.protocol import named_call
+            result = named_call(self._connection(), operation, *args)
+            return result.pd() if convert == "pd" else result.py()
+        return self.run(invoke)
 
     def is_alive(self) -> bool:
         """True when the current connection still answers."""
@@ -282,8 +313,14 @@ class KdbSession:
         if self._conn is None:
             return False
         try:
-            self._conn("1+1")
+            if self.secured:
+                from openbq_kdb.protocol import named_call, validate_handshake
+                self.capabilities = validate_handshake(named_call(self._conn, "ping").py())
+            else:
+                self._conn("1+1")
             return True
+        except _POLICY_FAILURES:
+            raise
         except Exception:
             return False
 
@@ -313,6 +350,7 @@ class KdbSession:
         if self._conn is not None and self._is_alive():
             return self._conn
         self._conn = None
+        self.capabilities = frozenset()
         self.endpoint = None
         spawned = False
         errors: list[str] = []
@@ -324,6 +362,10 @@ class KdbSession:
                 spawned = True
                 self._conn = self._connect_with_retry()
                 self.endpoint = "spawned"
+            except _POLICY_FAILURES:
+                if spawned:
+                    self._stop_proc()
+                raise
             except Exception as exc:  # noqa: BLE001 - fall through to the next link
                 errors.append(f"spawn: {exc}")
                 if spawned:
@@ -339,7 +381,10 @@ class KdbSession:
         if self._conn is None:
             try:
                 self._conn = self._connect(self.config.bind_host)
-                self.endpoint = "loopback"
+                self.endpoint = ("loopback" if self.config.bind_host == "127.0.0.1"
+                                 else f"{self.config.bind_host}:{self.config.port}")
+            except _POLICY_FAILURES:
+                raise
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"loopback: {exc}")
 
@@ -348,6 +393,8 @@ class KdbSession:
             try:
                 self._conn = self._connect(self.config.host)
                 self.endpoint = f"{self.config.host}:{self.config.port}"
+            except _POLICY_FAILURES:
+                raise
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{self.config.host}: {exc}")
 
