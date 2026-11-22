@@ -34,11 +34,13 @@ def data_server(tmp_path):
                '--data-dir', str(tmp_path / 'data')]
     processes = []
 
-    def start(init=None):
+    def start(init=None, *, wait=True):
         args = command + (["--init-script", str(init)] if init else [])
         proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=log,
                                 stderr=subprocess.STDOUT, env=env)
         processes.append(proc)
+        if not wait:
+            return proc
         for _ in range(200):
             if proc.poll() is not None:
                 log.seek(0)
@@ -408,3 +410,145 @@ def test_midbucket_start_floor_keeps_retained_candle_revisions(data_server):
         changes = chart_rpc(c, 'readChartChanges', snap['cursor'], view)
         assert changes['candles'][0]['key']['bucket_start'] == snap['view_floor']['bucket_start']
         assert changes['candles'][0]['open'] == 90.
+
+
+def test_diagnostics_role_utc_ring_and_restart_cursor(data_server):
+    connect, _ = data_server
+    with connect('role_diagnostics') as c:
+        result = chart_rpc(c, 'readDiagnostics', 0, 100)
+        assert result['boot_id']
+        records = [json.loads(event) for event in result['events']]
+        assert any(event['event'] == 'server_ready' for event in records)
+        for event in records:
+            assert event['schema_version'] == 1
+            assert event['timestamp'].endswith('Z')
+            assert 'password' not in event
+    with connect('chart') as c:
+        with pytest.raises(Exception, match='KDB_AUTHORIZATION'):
+            rpc(c, 'readDiagnostics', 0, 100)
+
+
+def diagnostic_events(c, after=0):
+    result = chart_rpc(c, 'readDiagnostics', after, 100)
+    return result, [json.loads(raw) for raw in result['events']]
+
+
+def test_diagnostic_flood_rate_limit_and_secret_field_whitelist(data_server):
+    connect, start = data_server
+    with connect('chart') as c:
+        for _ in range(80):
+            with pytest.raises(Exception, match='KDB_AUTHORIZATION'):
+                rpc(c, 'writeTicks', ticks())
+    with connect('role_diagnostics') as c:
+        result, events = diagnostic_events(c)
+        denied = [e for e in events if e['event'] == 'auth_denied']
+        assert denied
+        from collections import Counter
+        assert max(Counter(e['timestamp'][:19] for e in denied).values()) <= 10
+        assert all('price' not in e and 'password' not in e for e in events)
+    start.processes[-1].terminate()
+    start.processes[-1].wait(timeout=5)
+    init = connect.root / 'flood.q'
+    init.write_text('''
+{[i] .diag.counts:.diag.vocabulary!count[.diag.vocabulary]#0j;
+ .openbq.log[`info;`server_ready;`schema_version`timestamp`event`level`password`payload`request_id!(999;"secret-time";`evil;0;"secret-token";"secret-payload";"safe-id")]} each til 1100;
+if[count .finos.structlog.structlogTable;'"default-table-grew"];
+''')
+    start(init)
+    with connect('role_diagnostics') as c:
+        result, events = diagnostic_events(c)
+        assert result['overwritten'] >= 100
+        assert len(events) == 100
+        assert all(len(raw.encode()) <= 4096 for raw in result['events'])
+        assert all(e['schema_version'] == 1 and e['event'] == 'server_ready' for e in events)
+        assert 'secret-' not in json.dumps(events)
+        assert all(e['timestamp'].endswith('Z') and len(e['timestamp']) == 30 for e in events)
+        assert result['boot_id']
+
+
+def test_logger_failure_preserves_ticklog_failure_and_restart_boot(data_server):
+    connect, start = data_server
+    with connect('role_diagnostics') as c:
+        old, _ = diagnostic_events(c)
+    start.processes[-1].terminate()
+    start.processes[-1].wait(timeout=5)
+    init = connect.root / 'broken-logger.q'
+    init.write_text('''
+.diag.logger:`info`debug`warning`error!4#{[a;b] '"logger-failed"};
+.tlog.append:{[d] '"tlog: append-test"};
+''')
+    start(init)
+    with connect() as c:
+        with pytest.raises(Exception,match='tlog: append-test'):
+            rpc(c,'writeTicks',ticks())
+        assert rpc(c,'ticksPresent',ticks()).py() == 0
+    with connect('role_diagnostics') as c:
+        now, _ = diagnostic_events(c,old['next_sequence'])
+        assert now['boot_id'] != old['boot_id']
+
+
+def test_diagnostic_suppression_flush_is_observable_and_bounded(data_server):
+    connect, _ = data_server
+    with connect('chart') as c:
+        for _ in range(30):
+            with pytest.raises(Exception,match='KDB_AUTHORIZATION'):
+                rpc(c,'memory')
+    time.sleep(1.05)
+    with connect('role_diagnostics') as c:
+        _, events = diagnostic_events(c)
+        suppressed = [e for e in events if e['event'] == 'log_events_suppressed']
+        assert suppressed and sum(e['rows'] for e in suppressed) > 0
+        with pytest.raises(Exception,match='KDB_LIMIT'):
+            rpc(c,'readDiagnostics',0,101)
+
+
+def test_unrecoverable_whole_log_replay_error_refuses_readiness(data_server):
+    connect, start = data_server
+    with connect() as c:
+        rpc(c,'writeTicks',ticks())
+    start.processes[-1].terminate()
+    start.processes[-1].wait(timeout=5)
+    logfile = next((connect.root/'data'/'logs').glob('tlog_*'))
+    seed = connect.root/'append-bad-log.q'
+    seed.write_text('h:hopen hsym `$getenv `OPENBQ_BAD_LOG;h enlist (`upd;`trades;42);hclose h;exit 0;\n')
+    q = os.environ['OPENBQ_TEST_Q']
+    result = subprocess.run([q,str(seed),'-q'],stdin=subprocess.DEVNULL,capture_output=True,
+                            env=dict(os.environ,QHOME=str(Path(q).parent.parent),OPENBQ_BAD_LOG=str(logfile)))
+    assert result.returncode == 0
+    proc = start(wait=False)
+    try:
+        assert proc.wait(timeout=3) != 0
+    except subprocess.TimeoutExpired:
+        pytest.fail('unrecoverable valid-chunk replay error admitted a ready server')
+    with pytest.raises(OSError):
+        socket.create_connection(('127.0.0.1',connect.port),timeout=.1)
+
+
+def test_torn_tail_still_repairs_valid_prefix_without_duplicates(data_server):
+    connect,start=data_server
+    with connect() as c:
+        rpc(c,'writeTicks',ticks())
+    start.processes[-1].terminate()
+    start.processes[-1].wait(timeout=5)
+    logfile=next((connect.root/'data'/'logs').glob('tlog_*'))
+    with logfile.open('ab') as output:
+        output.write(b'\x01\x00\x00')
+    start()
+    with connect() as c:
+        assert rpc(c,'ticksPresent',ticks()).py()==2
+        assert len(rpc(c,'readTicks','AAPL',10).pd())==2
+    with connect('role_diagnostics') as c:
+        _,events=diagnostic_events(c)
+        assert any(e.get('error_code')=='TLOG_TORN' for e in events)
+
+
+def test_bootstrap_discards_raw_runtime_and_license_output(data_server):
+    connect,start=data_server
+    start.processes[-1].terminate()
+    start.processes[-1].wait(timeout=5)
+    init=connect.root/'noisy-init.q'
+    init.write_text('-1 "secret-license-output-DO-NOT-EXPOSE";\n')
+    start(init)
+    with connect() as c:
+        assert rpc(c,'writeTicks',ticks()).py()==2
+    assert 'secret-license-output' not in (connect.root/'server.log').read_text()

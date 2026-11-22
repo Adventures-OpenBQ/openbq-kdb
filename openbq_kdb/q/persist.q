@@ -25,7 +25,7 @@
 .tlog.cut:{[p]
   n:-11!(-2;p);
   if[0h<type n;
-    -2 "tlog: ",string[p]," has a bad tail; keeping its first ",string[n 0]," chunks (",string[n 1]," bytes)";
+    .openbq.log[`warning;`replay_failed;enlist[`error_code]!enlist `TLOG_TORN];
     tmp:`$string[p],".tmp";
     / a failed write (ENOSPC) leaves no partial temp file behind (S4)
     @[{x 1: y}tmp;read1(p;0;n 1);{[t;e] @[hdel;t;::]; 'e}tmp];
@@ -53,7 +53,7 @@
   .tlog.h x};
 / Every signal from here starts "tlog: " (T1): live-grid reads it as "kdb refused
 / the batch, applied nothing" -- an outage to back off from, never a poison batch.
-.tlog.fail:{[e] @[hclose;.tlog.h;::]; .tlog.h::0N; .tlog.torn::1b; -2 "tlog: append failed: ",e;
+.tlog.fail:{[e] @[hclose;.tlog.h;::]; .tlog.h::0N; .tlog.torn::1b; .openbq.log[`error;`rpc_failed;`operation`error_code!(`writeTicks;`TLOG_APPEND)];
   '$["tlog: "~6#e; e; "tlog: ",e]};
 if[not `updCore in key `.; updCore:upd];
 upd:{[t;d] if[.tlog.torn or not null .tlog.h; @[.tlog.append;enlist(`upd;t;d);.tlog.fail]]; updCore[t;d]};
@@ -68,16 +68,16 @@ upd:{[t;d] if[.tlog.torn or not null .tlog.h; @[.tlog.append;enlist(`upd;t;d);.t
 / upds are not re-logged.
 / A torn tail (host crash, power loss, ENOSPC; D4) is cut back first
 / (.tlog.cut), so today's appends follow a whole chunk, then replayed. Each file
-/ is trapped: one bad log must not abort this script, or the handle, the roll
-/ and .z.exit below never load and q runs on without logging. Only
+/ is trapped for a safe diagnostic, then unrecoverable replay errors abort
+/ bootstrap before readiness. Never serve a partial replay as a ready plant. Only
 / tlog_YYYY.MM.DD names are logs: a tlog_<d>.tmp a crash left mid-cut is not.
 .tlog.replayDays:2;
 .tlog.replay:{[f]
   p:` sv .tlog.dir,f;
   n:.tlog.cut p;
-  -1 "tlog: replaying ",string f; -11!(n;p)};
+  .openbq.log[`info;`replay_started;()!()]; -11!(n;p);.openbq.log[`info;`replay_completed;()!()]};
 if[not count trades;
-  {[f] @[.tlog.replay;f;{[f;e] -2 "tlog: replay of ",string[f]," failed: ",e}f]} each
+  {[f] @[.tlog.replay;f;{[f;e] .openbq.log[`error;`replay_failed;enlist[`error_code]!enlist `TLOG_REPLAY];'"KDB_REPLAY_FAILED"}f]} each
     {x where (x>=`$"tlog_",string .z.d-.tlog.replayDays) and not x like "*.tmp"} asc key .tlog.dir];
 
 / open today's log for appending (create empty if new)
@@ -98,7 +98,7 @@ if[not count trades;
     @[hclose;.tlog.h;::]; .tlog.h::0N; .tlog.torn::1b; .tlog.open .z.d;
     old:{x where x<`$"tlog_",string .z.d-7} key .tlog.dir;
     {hdel ` sv .tlog.dir,x} each old]};
-.z.ts:{@[.tlog.roll;::;{-2 "tlog roll failed: ",x;}]};
+.z.ts:{@[.tlog.roll;::;{.openbq.log[`error;`log_roll_failed;enlist[`error_code]!enlist `TLOG_ROLL];}]};
 system"t 60000";
 .z.exit:{@[hclose;.tlog.h;::]};
--1 "tick log active: ",string[.tlog.file .tlog.day]," (replay on boot, daily roll)";
+/ Tick log readiness is emitted through the bounded diagnostics pipeline.

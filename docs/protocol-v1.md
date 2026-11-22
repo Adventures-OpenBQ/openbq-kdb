@@ -57,8 +57,8 @@ Schema/prototypes are created locally before listening.
 
 q canonicalizes a homogeneous list: a singleton view dictionary becomes a
 one-row table, and timestamp-only arguments become a timestamp vector. Those
-canonical forms are admitted **only** for `readChartSnapshot`, `pruneTicks` and
-`dayCount`, at their declared arity and with full semantic validation. Other
+canonical forms are admitted **only** for `readChartSnapshot`, `pruneTicks`, `dayCount` and
+`readDiagnostics`, at their declared arity and with full semantic validation. Other
 operations still require a general list. This narrow exception is not a remote
 query/table execution path.
 
@@ -85,11 +85,12 @@ bar/coverage endpoints remain; chart/EOD end bounds are exclusive. Bars permit
 100,000 rows, 128 primitive data columns, 8 MiB encoded payload. Executable and
 nested provider columns are rejected. Columns beginning `qw` are reserved to
 prevent q SQL parameter shadowing. REST JSON is capped at 64 KiB; tick reads at
-1,000 rows; EOD slices at 250,000 within one day. Diagnostics is not implemented
-or advertised in this milestone.
+1,000 rows; EOD slices at 250,000 within one day. The diagnostics role may read the bounded operational event ring through
+`readDiagnostics`; it cannot change logging configuration.
 
 Persistence retains append-before-apply semantics, torn-tail repair and daily
-roll from v10. Trusted boot replay temporarily uses the local replay handler
+roll from v10. An unrecoverable whole-chunk replay/application error now aborts
+bootstrap instead of admitting a partially replayed ready plant. Trusted boot replay temporarily uses the local replay handler
 before networking is possible; authentication applies only to network ingress.
 The private stream records accepted batches only after durable append and public
 apply. A fresh nondeterministic epoch is generated after every restart; replayed
@@ -148,3 +149,45 @@ claimed. Keep controlled machine credentials, private networking and runtime
 memory containment. [KX callback documentation](https://code.kx.com/q/ref/dotz/)
 and [native password files](https://code.kx.com/q/basics/cmdline/) describe the
 runtime transport mechanisms.
+
+## Bounded structured diagnostics
+
+Tickplant loads the unmodified FINOS structlog source pinned at
+`e54032a57fd4d9c1288ef4807f2c9f7c22d1c290` from packaged vendor assets. The
+adjacent provenance records its SHA-256 and Apache license. Production config
+replaces all default processors before `getLogger`; the upstream default table
+stays empty. UTC JSON events are appended only to a 1,000-record q ring, at
+most 4 KiB per record. No operational logging writes stdout/files/network on
+the tick path. Default INFO excludes successful-batch DEBUG events. The fixed
+event vocabulary and typed field whitelist prevent payload/credential fields
+or reserved metadata overrides. Rate limiting admits 10 events/second/fixed
+event class; suppression totals are emitted on the next event or diagnostic
+read after the second changes. Counters and limiter keys are bounded.
+
+`readDiagnostics(after_sequence,limit)` requires diagnostics role, returns
+`boot_id,events,next_sequence,overwritten`, and permits at most 100 encoded JSON
+records per read. Reads are non-destructive. A changed boot ID requires a cursor
+reset; the Python pump rereads from zero. Ring overwrites are explicit, so this
+is operational visibility rather than a durable audit archive. Native `-U`
+credential rejection can occur before q's application callback and is not
+claimed as a complete application-level authentication audit.
+
+Enable external output explicitly:
+`DiagnosticPump(store, logger=None, interval=1.0, queue_size=1000).start()` from
+`openbq_kdb.diagnostics`. It polls through NamedKdbStore/session owner-thread RPC,
+passes only plain bounded records to a separate output worker, and emits JSON
+through Python's existing logging API. `close(timeout=.5)` is bounded;
+`pending,dropped,overwritten,failures` expose overload/output failures. Give the
+process identity diagnostics role explicitly. A blocked logger may leave one
+daemon output worker until process exit; it cannot block the poller or q owner.
+The optional pump also accepts fixed client connection lifecycle records through
+a nonblocking session sink. No Python structlog dependency is added.
+
+Spawned-q stdout/stderr is continuously consumed by a byte-only daemon drain.
+It retains at most 32 KiB of **fixed redaction markers**, never raw runtime or
+license text, and exposes a safe byte-count startup classification. It never
+calls an output logger. This deliberately sacrifices raw startup excerpts to
+avoid guessing a secret grammar for uncontrolled q/OS output. The bootstrap launcher uses the same drain and never forwards raw child output.
+A q process launched directly outside this wrapper can still block on its own
+container output driver; that residual path is not controlled by this package. Container log rotation/memory containment remain
+operator configuration, separate from the bounded application event ring.

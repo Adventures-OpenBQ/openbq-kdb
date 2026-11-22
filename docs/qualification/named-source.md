@@ -14,7 +14,7 @@ regressions in `tests/integration/test_named_data.py`.
 Final command:
 
 ```sh
-PYKX_UNLICENSED=true OPENBQ_TEST_Q=/Users/artcashin/.kx/bin/q \
+PYKX_UNLICENSED=true OPENBQ_TEST_Q="$Q_BINARY" \
   .superpowers/sdd/2026-11-22-kdb-finos-authorization-logging/venv/bin/python \
   -m pytest tests q/tests -q
 ```

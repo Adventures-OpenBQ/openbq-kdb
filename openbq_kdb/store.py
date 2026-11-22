@@ -743,6 +743,10 @@ class NamedKdbStore(KdbStore):
         payload = got['payload'].iloc[0]
         return json.loads(payload.decode() if isinstance(payload, bytes) else payload)
 
+    def read_diagnostics(self, after_sequence=0, limit=100):
+        from openbq_kdb.protocol import chart_result
+        return chart_result(self._named('readDiagnostics', after_sequence, limit))
+
     def stream_status(self):
         from openbq_kdb.protocol import chart_result
         return chart_result(self._named('streamStatus'))

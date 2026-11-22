@@ -18,7 +18,7 @@ dependencies = ["pykx>=3.2", "pandas"]
 include = ["openbq_kdb*"]
 
 [tool.setuptools.package-data]
-openbq_kdb = ["q/*.q", "resources/*.json"]
+openbq_kdb = ["q/*.q", "q/vendor/finos/*", "resources/*.json"]
 
 [project.optional-dependencies]
 dev = ["ruff==0.15.22", "pytest", "jsonschema>=4.18"]

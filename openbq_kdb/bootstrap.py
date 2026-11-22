@@ -17,6 +17,7 @@ import sys
 import tempfile
 
 from openbq_kdb.credentials import CredentialConfigurationError, load_server_credentials
+from openbq_kdb.diagnostics import RuntimeOutputDrain
 
 
 def main() -> int:
@@ -69,7 +70,9 @@ def main() -> int:
             command = [str(opts.q), str(startup), "-q", "-p", "0", "-U", str(password_copy)]
             if opts.workspace_mb:
                 command.extend(["-w", str(opts.workspace_mb)])
-            proc = subprocess.Popen(command, stdin=subprocess.PIPE, env=env, cwd=root)
+            proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, env=env, cwd=root)
+            output_drain = RuntimeOutputDrain(proc.stdout).start()
             previous = {}
 
             def forward(number, _frame):
@@ -79,7 +82,10 @@ def main() -> int:
             try:
                 for number in (signal.SIGTERM, signal.SIGINT):
                     previous[number] = signal.signal(number, forward)
-                return proc.wait()
+                code = proc.wait()
+                if code != 0:
+                    print("KDB_CHILD_EXITED", file=sys.stderr)
+                return code
             finally:
                 for number, handler in previous.items():
                     signal.signal(number, handler)
@@ -90,6 +96,7 @@ def main() -> int:
                     except subprocess.TimeoutExpired:
                         proc.kill()
                         proc.wait()
+                output_drain.close()
                 if proc.stdin:
                     proc.stdin.close()
 

@@ -14,3 +14,8 @@ trailers. Renamed openbq-kdb (module openbq_kdb) for Adventures-OpenBQ.
 kdb+ / KDB-X and PyKX are KX Systems products under their own licences. They are not
 included here: the stack runs a kdb-x image built from KX's portal with the operator's
 own licence, and PyKX is installed from PyPI.
+
+openbq_kdb/q/vendor/finos/structlog.q is the unmodified FINOS kdb structured
+logging example at commit e54032a57fd4d9c1288ef4807f2c9f7c22d1c290, licensed
+under Apache-2.0. Its source, hash and license are included alongside it.
+Production config replaces the default table inserter/local timestamp processors.

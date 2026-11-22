@@ -72,7 +72,6 @@ def aggregate_ticks(store, symbol: str, interval: str, start, end) -> list[dict]
     frame = store.aggregate_frame(symbol, interval, start, end)
     if frame is None or getattr(frame, "empty", True):
         return []
-    import math
 
     ordered = frame.sort_values("t")
     rows = []

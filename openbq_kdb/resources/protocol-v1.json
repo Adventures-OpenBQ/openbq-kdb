@@ -27,7 +27,8 @@
     "streamStatus",
     "readChartSnapshot",
     "readChartChanges",
-    "chart_stream_v1"
+    "chart_stream_v1",
+    "readDiagnostics"
   ],
   "wire": {
     "dispatcher": ".openbq.rpc",
@@ -50,7 +51,8 @@
     "canonical_args": {
       "readChartSnapshot": "one-row table of the view dictionary (q canonical singleton dictionary list)",
       "pruneTicks": "singleton timestamp vector",
-      "dayCount": "two-element timestamp vector"
+      "dayCount": "two-element timestamp vector",
+      "readDiagnostics": "two-element long vector"
     }
   },
   "roles": {
@@ -292,7 +294,7 @@
         "limit:long"
       ],
       "result": "dictionary(boot_id,events,next_sequence,overwritten)",
-      "implemented": false
+      "implemented": true
     },
     "streamStatus": {
       "args": [],
@@ -395,7 +397,7 @@
     "p95_accept_to_model_ms": 250,
     "max_p95_ingestion_regression_percent": 10
   },
-  "status": "Qualification mode implements ping only. Tickplant mode implements declared named data/chart operations and chart_stream_v1. Diagnostics remains unavailable. Platform/performance qualification is separate.",
+  "status": "Tickplant supports named data, accepted chart source and bounded diagnostics; qualification mode retains ping only. Platform/load qualification remains separate.",
   "qualification_capabilities": [
     "ping"
   ]
