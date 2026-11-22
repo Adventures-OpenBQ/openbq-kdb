@@ -1,0 +1,17 @@
+[
+  {
+    "path": "openbq_kdb/session.py",
+    "pinned_sha256": "488bd1e355638f16683d1df74c7911bd8b6df93959695797eaed80cb9501b2f1",
+    "vendored_sha256": "d4b3e9c531f2b360bfa0e32e17487a10091a6dd094bd2408fe65740e6c088d0b"
+  },
+  {
+    "path": "tests/test_crash_recovery.py",
+    "pinned_sha256": "f91558bee15869391c78965afedea092157ee130268560c94b5adc468a3afcf2",
+    "vendored_sha256": "4b34f5dcf7dcd9e29782029e1c76a7268f8ee43f0fb002d242888221d183a388"
+  },
+  {
+    "path": "tests/test_session.py",
+    "pinned_sha256": "f17d52fffc3ff49745997fbb02a0cdc9ca36015cc1ee2ddd69f555f339ca8f0b",
+    "vendored_sha256": "cbc11c3cf1b09f38fd8a94837250936f38a0e40aecfe78789f3d6ded8dc6fdce"
+  }
+]
