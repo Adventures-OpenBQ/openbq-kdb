@@ -1,0 +1,2 @@
+# Preserve the pinned upstream FINOS source byte-for-byte, including its final blank line.
+openbq_kdb/q/vendor/finos/structlog.q whitespace=-blank-at-eof
