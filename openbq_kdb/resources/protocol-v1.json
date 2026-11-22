@@ -1,0 +1,404 @@
+{
+  "protocol_version": 1,
+  "stage": "named-data-and-chart-source",
+  "implemented_capabilities": [
+    "ping",
+    "memory",
+    "barPrototype",
+    "tickPrototype",
+    "readBars",
+    "writeBars",
+    "readCoverage",
+    "recordCoverage",
+    "touch",
+    "drop",
+    "lruRows",
+    "writeTicks",
+    "ticksPresent",
+    "pruneTicks",
+    "tickSpan",
+    "latestTick",
+    "readTicks",
+    "aggregateFrame",
+    "writeSnapshot",
+    "readSnapshot",
+    "dayCount",
+    "daySlice",
+    "streamStatus",
+    "readChartSnapshot",
+    "readChartChanges",
+    "chart_stream_v1",
+    "readDiagnostics"
+  ],
+  "wire": {
+    "dispatcher": ".openbq.rpc",
+    "message": [
+      "symbol:.openbq.rpc",
+      "symbol:operation",
+      "general_list:args",
+      "char_vector:request_id"
+    ],
+    "pykx": {
+      "no_ctx": true,
+      "reconnection_attempts": -1,
+      "debug": false,
+      "skip_debug": true,
+      "connection_timeout_seconds": 5,
+      "query_timeout_seconds": 5
+    },
+    "integer_wire": "decimal int64 strings for browser cursors/counters; q long for native operation args",
+    "max_sequence": "9223372036854775807",
+    "canonical_args": {
+      "readChartSnapshot": "one-row table of the view dictionary (q canonical singleton dictionary list)",
+      "pruneTicks": "singleton timestamp vector",
+      "dayCount": "two-element timestamp vector",
+      "readDiagnostics": "two-element long vector"
+    }
+  },
+  "roles": {
+    "query": [
+      "ping",
+      "memory",
+      "barPrototype",
+      "tickPrototype",
+      "readBars",
+      "readCoverage",
+      "tickSpan",
+      "latestTick",
+      "readTicks",
+      "aggregateFrame",
+      "readSnapshot"
+    ],
+    "cache": [
+      "ping",
+      "memory",
+      "barPrototype",
+      "tickPrototype",
+      "readBars",
+      "readCoverage",
+      "tickSpan",
+      "latestTick",
+      "readTicks",
+      "aggregateFrame",
+      "readSnapshot",
+      "writeBars",
+      "recordCoverage",
+      "touch",
+      "drop",
+      "writeSnapshot",
+      "lruRows"
+    ],
+    "recorder": [
+      "ping",
+      "memory",
+      "barPrototype",
+      "tickPrototype",
+      "readBars",
+      "readCoverage",
+      "tickSpan",
+      "latestTick",
+      "readTicks",
+      "aggregateFrame",
+      "readSnapshot",
+      "writeTicks",
+      "ticksPresent",
+      "pruneTicks"
+    ],
+    "export": [
+      "ping",
+      "dayCount",
+      "daySlice"
+    ],
+    "diagnostics": [
+      "ping",
+      "readDiagnostics"
+    ],
+    "chart": [
+      "ping",
+      "streamStatus",
+      "readChartSnapshot",
+      "readChartChanges"
+    ]
+  },
+  "operations": {
+    "ping": {
+      "args": [],
+      "result": "dictionary(protocol_version:int,ready:bool,capabilities:symbol[])",
+      "implemented": true
+    },
+    "memory": {
+      "args": [],
+      "result": "dictionary(used,heap,peak,wmax,mphy:long)",
+      "implemented": true
+    },
+    "barPrototype": {
+      "args": [
+        "symbol:string",
+        "interval:string"
+      ],
+      "result": "empty bar table; empty general list if absent",
+      "implemented": true
+    },
+    "tickPrototype": {
+      "args": [],
+      "result": "empty table(time:timestamp,sym:symbol,price:float,size:float)",
+      "implemented": true
+    },
+    "readBars": {
+      "args": [
+        "symbol:string",
+        "interval:string",
+        "start:timestamp",
+        "end:timestamp"
+      ],
+      "result": "bar table; inclusive endpoints",
+      "implemented": true
+    },
+    "writeBars": {
+      "args": [
+        "symbol:string",
+        "interval:string",
+        "rows:table"
+      ],
+      "result": "generic null; existing t-keyed upsert semantics",
+      "implemented": true
+    },
+    "readCoverage": {
+      "args": [
+        "symbol:string",
+        "interval:string"
+      ],
+      "result": "table(s:timestamp,e:timestamp)",
+      "implemented": true
+    },
+    "recordCoverage": {
+      "args": [
+        "symbol:string",
+        "interval:string",
+        "start:timestamp",
+        "end:timestamp"
+      ],
+      "result": "generic null",
+      "implemented": true
+    },
+    "touch": {
+      "args": [
+        "symbol:string",
+        "interval:string"
+      ],
+      "result": "generic null",
+      "implemented": true
+    },
+    "drop": {
+      "args": [
+        "symbol:string",
+        "interval:string"
+      ],
+      "result": "generic null; cache tables only",
+      "implemented": true
+    },
+    "lruRows": {
+      "args": [],
+      "result": "table(sym:symbol,iv:symbol,atime:timestamp)",
+      "implemented": true
+    },
+    "writeTicks": {
+      "args": [
+        "rows:table"
+      ],
+      "result": "long accepted row count; one unchanged acknowledgment unit",
+      "implemented": true
+    },
+    "ticksPresent": {
+      "args": [
+        "rows:table"
+      ],
+      "result": "long multiset matched row count",
+      "implemented": true
+    },
+    "pruneTicks": {
+      "args": [
+        "cutoff:timestamp"
+      ],
+      "result": "long rows remaining",
+      "implemented": true
+    },
+    "tickSpan": {
+      "args": [
+        "symbol:string"
+      ],
+      "result": "table(lo:timestamp,hi:timestamp), zero rows if absent",
+      "implemented": true
+    },
+    "latestTick": {
+      "args": [
+        "symbol:string"
+      ],
+      "result": "table(time:timestamp,price:float,size:float), zero rows if absent",
+      "implemented": true
+    },
+    "readTicks": {
+      "args": [
+        "symbol:string",
+        "limit:long"
+      ],
+      "result": "table(time:timestamp,price:float,size:float), newest first",
+      "implemented": true
+    },
+    "aggregateFrame": {
+      "args": [
+        "symbol:string",
+        "start:timestamp",
+        "end:timestamp",
+        "bucket_ns:long"
+      ],
+      "result": "unkeyed table(t:timestamp,open,high,low,close,volume,vwap:float)",
+      "implemented": true
+    },
+    "writeSnapshot": {
+      "args": [
+        "symbol:string",
+        "payload_json:string"
+      ],
+      "result": "generic null",
+      "implemented": true
+    },
+    "readSnapshot": {
+      "args": [
+        "symbol:string"
+      ],
+      "result": "table(fetched:timestamp,payload:string); client checks UTC TTL",
+      "implemented": true
+    },
+    "dayCount": {
+      "args": [
+        "start:timestamp",
+        "end:timestamp"
+      ],
+      "result": "long; half-open [start,end)",
+      "implemented": true
+    },
+    "daySlice": {
+      "args": [
+        "start:timestamp",
+        "end:timestamp",
+        "offset:long",
+        "limit:long"
+      ],
+      "result": "table(time:timestamp,sym:symbol,price:float,size:float); half-open",
+      "implemented": true
+    },
+    "readDiagnostics": {
+      "args": [
+        "after_sequence:long",
+        "limit:long"
+      ],
+      "result": "dictionary(boot_id,events,next_sequence,overwritten)",
+      "implemented": true
+    },
+    "streamStatus": {
+      "args": [],
+      "result": "dictionary(epoch,low_cursor,high_cursor,current_cursor,coverage,clock,limits); clock UTC ISO nanoseconds string",
+      "implemented": true
+    },
+    "readChartSnapshot": {
+      "args": [
+        "view:dictionary"
+      ],
+      "result": "dictionary(view,cursor,view_floor,coverage,truncated,items)",
+      "implemented": true
+    },
+    "readChartChanges": {
+      "args": [
+        "cursor:dictionary",
+        "view:dictionary"
+      ],
+      "result": "dictionary(from_cursor,through_cursor,batches|candles,unavailable_buckets,coverage) or resync_required",
+      "implemented": true
+    }
+  },
+  "limits": {
+    "request_id_bytes": 128,
+    "credential_file_bytes": 65536,
+    "identity_bytes": 64,
+    "symbol_bytes": 64,
+    "interval_bytes": 16,
+    "tick_write_rows": 100000,
+    "tick_probe_rows": 100000,
+    "bar_write_rows": 100000,
+    "bar_columns": 128,
+    "bar_payload_bytes": 8388608,
+    "snapshot_payload_bytes": 65536,
+    "read_ticks_rows": 1000,
+    "day_slice_rows": 250000,
+    "day_window_ns": 86400000000000,
+    "chart_snapshot_ticks": 10000,
+    "chart_snapshot_candles": 2000,
+    "chart_response_bytes": 8388608,
+    "chart_chunk_bytes": 524288,
+    "chart_retained_ticks": 1000000,
+    "chart_retained_payload_bytes": 134217728,
+    "chart_retention_seconds": 60,
+    "chart_scan_rows": 100000,
+    "chart_call_target_ms": 10,
+    "chart_control_message_bytes": 65536,
+    "chart_control_messages_per_second": 10,
+    "chart_pending_bytes_per_connection": 8388608,
+    "chart_pending_messages_per_connection": 100,
+    "chart_pending_bytes_per_process": 134217728,
+    "chart_connections": 64,
+    "chart_subscriptions_per_connection": 8,
+    "chart_pump_ms": 50,
+    "chart_send_timeout_seconds": 5,
+    "chart_progress_timeout_seconds": 15,
+    "chart_heartbeat_seconds": 5,
+    "diagnostic_records": 1000,
+    "diagnostic_record_bytes": 4096,
+    "diagnostic_read_records": 100,
+    "tick_rows_export_columns": 4
+  },
+  "intervals": {
+    "1s": 1000000000,
+    "1m": 60000000000,
+    "5m": 300000000000,
+    "15m": 900000000000,
+    "30m": 1800000000000,
+    "1h": 3600000000000,
+    "1d": 86400000000000
+  },
+  "errors": [
+    "KDB_ENVELOPE",
+    "KDB_ARGUMENT",
+    "KDB_NOT_READY",
+    "KDB_AUTHORIZATION",
+    "KDB_OPERATION_UNAVAILABLE",
+    "KDB_PROTOCOL_VERSION",
+    "KDB_LIMIT",
+    "KDB_COVERAGE"
+  ],
+  "resync_reasons": [
+    "epoch_changed",
+    "cursor_expired",
+    "cursor_ahead",
+    "catchup_limit",
+    "coverage_lost",
+    "slow_consumer",
+    "view_mismatch"
+  ],
+  "normal_load_fixture": {
+    "symbols": 4,
+    "aggregate_ticks_per_second": 1000,
+    "flush_ms": 250,
+    "normal_batch_rows": 250,
+    "responsive_clients": 8,
+    "views_per_client": 1,
+    "duration_seconds": 60,
+    "warmup_seconds": 10,
+    "p95_accept_to_model_ms": 250,
+    "max_p95_ingestion_regression_percent": 10
+  },
+  "status": "Tickplant supports named data, accepted chart source and bounded diagnostics; qualification mode retains ping only. Platform/load qualification remains separate.",
+  "qualification_capabilities": [
+    "ping"
+  ]
+}

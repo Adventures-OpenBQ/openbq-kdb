@@ -33,6 +33,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from openbq_kdb.config import KdbConfig
+from openbq_kdb.protocol import KdbAuthenticationError, KdbAuthorizationError, KdbProtocolError
+
+_POLICY_FAILURES = (KdbAuthenticationError, KdbAuthorizationError, KdbProtocolError)
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +94,7 @@ _RETRY_INITIAL_S = 1.0
 _RETRY_AFTER_S = 15.0  # the cap
 
 
-def _env_seconds(name: str, default: float) -> float:
+def _env_seconds(name: str, default: float, *, log_invalid=True) -> float:
     """A non-negative float from the environment, else `default` (logged)."""
     import os
 
@@ -101,18 +104,20 @@ def _env_seconds(name: str, default: float) -> float:
     try:
         value = float(raw)
     except ValueError:
-        logger.warning("%s=%r is not a number; using %.1f", name, raw, default)
+        if log_invalid:
+            logger.warning("%s is not a number; using %.1f", name, default)
         return default
     if value < 0 or value != value:  # negative or NaN
-        logger.warning("%s=%r is negative; using %.1f", name, raw, default)
+        if log_invalid:
+            logger.warning("%s is negative; using %.1f", name, default)
         return default
     return value
 
 
-def retry_delay(failures: int) -> float:
+def retry_delay(failures: int, *, log_invalid=True) -> float:
     """Seconds to hold off after `failures` consecutive failed connects (>= 1)."""
-    initial = _env_seconds("KDB_RETRY_INITIAL_S", _RETRY_INITIAL_S)
-    cap = _env_seconds("KDB_RETRY_MAX_S", _RETRY_AFTER_S)
+    initial = _env_seconds("KDB_RETRY_INITIAL_S", _RETRY_INITIAL_S, log_invalid=log_invalid)
+    cap = _env_seconds("KDB_RETRY_MAX_S", _RETRY_AFTER_S, log_invalid=log_invalid)
     exponent = min(max(failures, 1) - 1, 30)  # 2**30 s is past any sane cap
     return min(cap, initial * (2 ** exponent))
 
@@ -126,6 +131,12 @@ class KdbSession:
 
     def __init__(self, config: KdbConfig, clock=time.monotonic):
         self.config = config
+        import os
+        from openbq_kdb.credentials import load_client_credentials
+        self.secured = bool(os.environ.get("KDB_USERNAME") or os.environ.get("KDB_PASSWORD_FILE"))
+        self._credentials = load_client_credentials() if self.secured else None
+        self.capabilities: frozenset[str] = frozenset()
+        self._diagnostic_sink = None
         # Injected for the backoff tests; production uses time.monotonic.
         self._clock = clock
         # Consecutive failed connects since the last success (drives the backoff).
@@ -133,7 +144,7 @@ class KdbSession:
         self._conn = None
         self.endpoint: str | None = None
         self._proc: subprocess.Popen | None = None
-        self._proc_log_path: str | None = None
+        self._output_drain = None
         # Monotonic deadline before which a connect is not re-attempted. 0.0
         # means "never failed yet". See _RETRY_AFTER_S and retry_delay().
         self._retry_after = 0.0
@@ -167,9 +178,33 @@ class KdbSession:
         self._owner_ident = threading.get_ident()
         return fn()
 
+    def _diagnostic_event(self, event):
+        """Offer a fixed lifecycle event to the optional nonblocking pump sink."""
+        if self._diagnostic_sink is None:
+            return
+        from datetime import datetime, timezone
+        import os
+        now = datetime.now(timezone.utc)
+        record = dict(schema_version=1,
+                      timestamp=now.strftime('%Y-%m-%dT%H:%M:%S.') + f'{now.microsecond:06d}000Z',
+                      level=30 if event == 'connection_failed' else 20,
+                      event=event, component='kdb-client', pid=os.getpid(), operation='connect')
+        try:
+            self._diagnostic_sink(record)
+        except Exception:
+            pass
+
     def _q_argv(self) -> list[str]:
         """Argument vector for the q server."""
         cfg = self.config
+        if self.secured:
+            import os
+            import sys
+            return [sys.executable, "-m", "openbq_kdb.bootstrap", "--q",
+                    f"{cfg.local_qhome}/bin/q", "--port", str(cfg.port),
+                    "--bind", cfg.bind_host, "--mode", "tickplant",
+                    "--workspace-mb", str(cfg.q_workspace_mb), "--data-dir",
+                    os.environ.get("KDB_DATA_DIR", f"{cfg.local_qhome}/data")]
         return [
             f"{cfg.local_qhome}/bin/q",
             "-p", f"{cfg.bind_host}:{cfg.port}",
@@ -183,57 +218,34 @@ class KdbSession:
         stdin is a pipe we never close: q reads its console from stdin and
         exits on EOF, which in a detached container happens immediately.
 
-        stdout/stderr go to a temp file, not a pipe: nothing ever reads a
-        PIPE for a long-lived child, so once q writes enough output to fill
-        the OS pipe buffer its write() blocks forever -- a live, undetectable
-        hang instead of the clean death this module is built to handle. The
-        file is read back only if q exits immediately, to preserve the
-        startup diagnostic (e.g. a missing license).
+        A dedicated byte-only drain consumes stdout/stderr continuously. It
+        retains only fixed redaction codes, bounded to 32 KiB; runtime/license
+        output is never passed to a potentially blocking logging handler.
         """
         import os
-        import tempfile
+        from openbq_kdb.diagnostics import RuntimeOutputDrain
 
         if self._proc is not None and self._proc.poll() is None:
             return
         self._cleanup_log_file()
         env = dict(os.environ, QHOME=self.config.local_qhome, QLIC=self.config.qlic)
-        log_file = tempfile.NamedTemporaryFile(
-            prefix="openbb-kdb-q-", suffix=".log", delete=False
+        self._proc = subprocess.Popen(  # noqa: S603
+            self._q_argv(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, env=env, cwd=self.config.local_qhome,
         )
-        self._proc_log_path = log_file.name
-        try:
-            self._proc = subprocess.Popen(  # noqa: S603
-                self._q_argv(),
-                stdin=subprocess.PIPE,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                env=env,
-                cwd=self.config.local_qhome,
-            )
-        finally:
-            log_file.close()
+        stream = getattr(self._proc, "stdout", None)
+        if stream is not None:
+            self._output_drain = RuntimeOutputDrain(stream).start()
 
     def _read_proc_log(self) -> str:
-        """Best-effort read of the spawned q's captured stdout/stderr."""
-        if not self._proc_log_path:
-            return ""
-        try:
-            with open(self._proc_log_path, "rb") as fh:
-                return fh.read().decode(errors="replace")
-        except OSError:
-            return ""
+        """Safe bounded startup classification; never raw runtime/license text."""
+        return self._output_drain.summary() if self._output_drain is not None else ""
 
     def _cleanup_log_file(self) -> None:
-        """Remove the previous spawn's log file, if any. Best-effort."""
-        import os
-
-        if self._proc_log_path is None:
-            return
-        try:
-            os.remove(self._proc_log_path)
-        except OSError:
-            pass
-        self._proc_log_path = None
+        """Retire the bounded runtime drain (legacy method name retained)."""
+        if self._output_drain is not None:
+            self._output_drain.close()
+            self._output_drain = None
 
     def _connect(self, host: str | None = None):
         """Open a PyKX IPC connection (unlicensed client mode -- no licence needed).
@@ -250,6 +262,11 @@ class KdbSession:
         """
         import pykx as kx
 
+        if self.secured:
+            from openbq_kdb.protocol import connect_qualified, named_call, validate_handshake
+            conn = connect_qualified(host or "127.0.0.1", self.config.port, self._credentials)
+            self.capabilities = validate_handshake(named_call(conn, "ping").py())
+            return conn
         return kx.SyncQConnection(
             host or "127.0.0.1", self.config.port, connection_timeout=_CONNECT_BUDGET_S
         )
@@ -269,10 +286,20 @@ class KdbSession:
                 raise OSError(f"q exited immediately: {out}")
             try:
                 return self._connect()
+            except _POLICY_FAILURES:
+                raise
             except Exception:
                 if self._proc is None or time.monotonic() >= deadline:
                     raise
                 time.sleep(_CONNECT_POLL_INTERVAL_S)
+
+    def rpc(self, operation: str, *args, convert="py"):
+        """Call a named operation and convert its result on the q owner thread."""
+        def invoke():
+            from openbq_kdb.protocol import named_call
+            result = named_call(self._connection(), operation, *args)
+            return result.pd() if convert == "pd" else result.py()
+        return self.run(invoke)
 
     def is_alive(self) -> bool:
         """True when the current connection still answers."""
@@ -282,8 +309,14 @@ class KdbSession:
         if self._conn is None:
             return False
         try:
-            self._conn("1+1")
+            if self.secured:
+                from openbq_kdb.protocol import named_call, validate_handshake
+                self.capabilities = validate_handshake(named_call(self._conn, "ping").py())
+            else:
+                self._conn("1+1")
             return True
+        except _POLICY_FAILURES:
+            raise
         except Exception:
             return False
 
@@ -313,6 +346,7 @@ class KdbSession:
         if self._conn is not None and self._is_alive():
             return self._conn
         self._conn = None
+        self.capabilities = frozenset()
         self.endpoint = None
         spawned = False
         errors: list[str] = []
@@ -324,6 +358,10 @@ class KdbSession:
                 spawned = True
                 self._conn = self._connect_with_retry()
                 self.endpoint = "spawned"
+            except _POLICY_FAILURES:
+                if spawned:
+                    self._stop_proc()
+                raise
             except Exception as exc:  # noqa: BLE001 - fall through to the next link
                 errors.append(f"spawn: {exc}")
                 if spawned:
@@ -339,7 +377,10 @@ class KdbSession:
         if self._conn is None:
             try:
                 self._conn = self._connect(self.config.bind_host)
-                self.endpoint = "loopback"
+                self.endpoint = ("loopback" if self.config.bind_host == "127.0.0.1"
+                                 else f"{self.config.bind_host}:{self.config.port}")
+            except _POLICY_FAILURES:
+                raise
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"loopback: {exc}")
 
@@ -348,18 +389,22 @@ class KdbSession:
             try:
                 self._conn = self._connect(self.config.host)
                 self.endpoint = f"{self.config.host}:{self.config.port}"
+            except _POLICY_FAILURES:
+                raise
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{self.config.host}: {exc}")
 
         if self._conn is None:
             self._failures += 1
-            delay = retry_delay(self._failures)
+            delay = retry_delay(self._failures, log_invalid=not self.secured)
             self._retry_after = self._clock() + delay
             detail = "; ".join(errors) or "no kdb+ endpoint configured"
-            logger.warning(
-                "kdb+ unavailable, falling back to upstream (attempt %d, retrying in %.1fs): %s",
-                self._failures, delay, detail,
-            )
+            self._diagnostic_event('connection_failed')
+            if not self.secured:
+                logger.warning(
+                    "kdb+ unavailable, falling back to upstream (attempt %d, retrying in %.1fs): %s",
+                    self._failures, delay, detail,
+                )
             raise KdbUnavailable(detail)
 
         # A connect that succeeded clears the latch and the backoff: the next
@@ -367,6 +412,7 @@ class KdbSession:
         # stale deadline or a long doubled one.
         self._retry_after = 0.0
         self._failures = 0
+        self._diagnostic_event('connection_recovered')
         return self._conn
 
     def _stop_proc(self) -> None:
@@ -381,15 +427,18 @@ class KdbSession:
             try:
                 proc.wait(timeout=_TERMINATE_WAIT_S)
             except subprocess.TimeoutExpired:
-                logger.warning("q did not exit within %.1fs of SIGTERM; sending SIGKILL",
-                                _TERMINATE_WAIT_S)
+                if not self.secured:
+                    logger.warning("q did not exit within %.1fs of SIGTERM; sending SIGKILL",
+                                   _TERMINATE_WAIT_S)
                 proc.kill()
                 try:
                     proc.wait(timeout=_KILL_WAIT_S)
                 except subprocess.TimeoutExpired:
-                    logger.warning("q did not exit within %.1fs of SIGKILL", _KILL_WAIT_S)
+                    if not self.secured:
+                        logger.warning("q did not exit within %.1fs of SIGKILL", _KILL_WAIT_S)
         except Exception:
-            logger.debug("error while stopping q process", exc_info=True)
+            if not self.secured:
+                logger.debug("error while stopping q process", exc_info=True)
         self._cleanup_log_file()
 
     def close(self) -> None:
@@ -404,16 +453,19 @@ class KdbSession:
         except Exception:
             # The owner thread is already gone (or never started): the child
             # process still has to be reaped, and _shutdown is idempotent.
-            logger.debug("kdb+ shutdown could not run on the owner thread", exc_info=True)
+            if not self.secured:
+                logger.debug("kdb+ shutdown could not run on the owner thread", exc_info=True)
             try:
                 self._shutdown()
             except Exception:
-                logger.debug("error during kdb+ shutdown", exc_info=True)
+                if not self.secured:
+                    logger.debug("error during kdb+ shutdown", exc_info=True)
         self._closed = True
         try:
             self._executor.shutdown(wait=True)
         except Exception:
-            logger.debug("error shutting down the kdb+ owner thread", exc_info=True)
+            if not self.secured:
+                logger.debug("error shutting down the kdb+ owner thread", exc_info=True)
         # Thread identities are recycled once a thread is gone: a stale ident
         # would let some unrelated future thread take the re-entrant path.
         self._owner_ident = None
@@ -424,6 +476,7 @@ class KdbSession:
             if self._conn is not None:
                 self._conn.close()
         except Exception as exc:
-            logger.debug("error closing kdb+ IPC connection: %s", exc)
+            if not self.secured:
+                logger.debug("error closing kdb+ IPC connection: %s", exc)
         self._conn = None
         self._stop_proc()

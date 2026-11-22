@@ -64,7 +64,7 @@ def test_openbq_kdb_reconnects_to_a_restarted_q_and_reads_the_replayed_day(host)
         store.tick_span("AAPL")  # the dead connection fails its 1+1 and nothing answers
     host.start()
     assert store.tick_span("AAPL") == (lo, hi)
-    assert store.session.endpoint == "loopback"  # link 2: bind_host
+    assert store.session.endpoint == "kdb:5000"  # link 2 reports its actual bind_host
     assert len(store.read_ticks("AAPL", 1000)) == 120
     # writes after the restart land in the new log and survive the next restart
     store.write_ticks(_ticks(30, start=datetime(2026, 10, 9, 16)))

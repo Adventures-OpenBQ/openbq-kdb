@@ -1,0 +1,1 @@
+{"repository":"https://github.com/finos/kdb","commit":"e54032a57fd4d9c1288ef4807f2c9f7c22d1c290","source":"q/structlog/structlog.q","sha256":"196040a6ed75f6979fa525b5a02f05d45d97f0797b191121ce810de1f6183b30","license":"Apache-2.0","changes":"none; production processor configuration replaces all defaults before getLogger"}
